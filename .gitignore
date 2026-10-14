@@ -1,0 +1,17 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# PyInstaller 打包中间产物与产物
+build/
+dist/
+
+# 运行时自动创建的用户数据（流程 JSON / 找图模板）
+flows/
+templates/
+
+# 编辑器与日志
+.idea/
+.vscode/
+*.log
