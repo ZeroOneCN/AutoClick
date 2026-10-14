@@ -28,9 +28,11 @@ from core.device import ShellChannel, TouchStream
 from core.recorder import Recorder
 from core.vision import Locator
 
-# 界面统一字体（Windows 自带「宋体」SimSun，无需额外字体文件）
-UI_FONT = "宋体"
+# 界面统一字体：Windows 自带的「微软雅黑」（Microsoft YaHei）。它带 ClearType 字形
+# 微调信息，小字号下比点阵渲染的「宋体」清晰得多；日志区再放大 1 号以免长时间阅读吃力。
+UI_FONT = "微软雅黑"
 UI_FONT_SIZE = 10
+LOG_FONT_SIZE = 11
 
 
 class AutoClickApp:
@@ -48,8 +50,8 @@ class AutoClickApp:
         """
         self.root = root
         self.root.title("AutoClick - 安卓自动化工具")
-        self.root.geometry("1180x880")
-        self.root.minsize(1040, 720)
+        self.root.geometry("1040x740")
+        self.root.minsize(720, 540)  # 支持小窗口使用：各页控件均可随之收窄
         self._setup_fonts()
 
         # ---- 设备状态 ----
@@ -90,7 +92,7 @@ class AutoClickApp:
     # ------------------------------------------------------------------
 
     def _setup_fonts(self) -> None:
-        """把界面全局字体统一设置为宋体（含 ttk 控件、树列表与文本控件）。
+        """把界面全局字体统一设置为微软雅黑（含 ttk 控件、树列表与文本控件）。
 
         tkinter 的默认命名字体（TkDefaultFont 等）会被 ttk 控件继承，修改它们即可
         一次性覆盖绝大多数控件；Treeview 的行与表头不跟随默认字体，需单独设置样式；
@@ -107,7 +109,7 @@ class AutoClickApp:
                 continue
             font.configure(family=UI_FONT, size=UI_FONT_SIZE)
         style = ttk.Style(self.root)
-        # 宋体行高偏小，适当加大行高以便看清步骤列表
+        # 适当加大行高，避免中文行贴在一起
         style.configure("Treeview", font=(UI_FONT, UI_FONT_SIZE), rowheight=24)
         style.configure("Treeview.Heading", font=(UI_FONT, UI_FONT_SIZE))
 
@@ -122,21 +124,22 @@ class AutoClickApp:
         self._build_device_bar()
 
         self.paned = ttk.PanedWindow(self.root, orient="vertical")
-        self.paned.pack(fill="both", expand=True, padx=6, pady=(2, 0))
+        self.paned.pack(fill="both", expand=True, padx=4, pady=(2, 0))
 
         self.tabs = ttk.Notebook(self.paned)
-        self.paned.add(self.tabs, weight=3)
+        # 分页区与日志区按 2:1 分配，避免分页内容较少时中间留下大片空白
+        self.paned.add(self.tabs, weight=2)
         quick = ttk.Frame(self.tabs)
-        self.tabs.add(quick, text="  固定坐标连点  ")
+        self.tabs.add(quick, text="固定坐标连点")
         self._build_quick_tab(quick)
 
         flow_tab = ttk.Frame(self.tabs)
-        self.tabs.add(flow_tab, text="  流程编排  ")
+        self.tabs.add(flow_tab, text="流程编排")
         self.flow_tab = flow_tab
         self._build_flow_tab(flow_tab)
 
         record_tab = ttk.Frame(self.tabs)
-        self.tabs.add(record_tab, text="  录制回放  ")
+        self.tabs.add(record_tab, text="录制回放")
         self.record_tab = record_tab
         self._build_record_tab(record_tab)
 
@@ -152,34 +155,34 @@ class AutoClickApp:
         :return: 无返回值。
         """
         frame = ttk.LabelFrame(self.root, text="设备")
-        frame.pack(fill="x", padx=6, pady=(6, 2))
+        frame.pack(fill="x", padx=4, pady=(2, 1))
 
-        ttk.Label(frame, text="adb 路径:").grid(row=0, column=0, sticky="w", padx=(8, 4), pady=4)
+        ttk.Label(frame, text="adb 路径:").grid(row=0, column=0, sticky="w", padx=(8, 4), pady=3)
         self.adb_var = tk.StringVar()
-        ttk.Entry(frame, textvariable=self.adb_var, width=62).grid(
-            row=0, column=1, columnspan=3, sticky="we", pady=4
+        ttk.Entry(frame, textvariable=self.adb_var, width=32).grid(
+            row=0, column=1, columnspan=3, sticky="we", pady=3
         )
-        ttk.Button(frame, text="浏览…", width=8, command=self._browse_adb).grid(
-            row=0, column=4, padx=4, pady=4
+        ttk.Button(frame, text="浏览…", width=7, command=self._browse_adb).grid(
+            row=0, column=4, padx=4, pady=3
         )
-        ttk.Button(frame, text="自动探测", width=10, command=self._auto_detect_adb).grid(
-            row=0, column=5, padx=(0, 8), pady=4
+        ttk.Button(frame, text="自动探测", width=9, command=self._auto_detect_adb).grid(
+            row=0, column=5, padx=(0, 6), pady=3
         )
 
-        ttk.Label(frame, text="设备:").grid(row=1, column=0, sticky="w", padx=(8, 4), pady=4)
+        ttk.Label(frame, text="设备:").grid(row=1, column=0, sticky="w", padx=(8, 4), pady=3)
         self.serial_var = tk.StringVar()
-        self.device_combo = ttk.Combobox(frame, textvariable=self.serial_var, state="readonly", width=30)
-        self.device_combo.grid(row=1, column=1, sticky="w", pady=4)
-        ttk.Button(frame, text="刷新设备", width=10, command=self.refresh_devices).grid(
-            row=1, column=2, padx=4, pady=4
+        self.device_combo = ttk.Combobox(frame, textvariable=self.serial_var, state="readonly", width=20)
+        self.device_combo.grid(row=1, column=1, sticky="we", pady=3)
+        ttk.Button(frame, text="刷新设备", width=9, command=self.refresh_devices).grid(
+            row=1, column=2, padx=4, pady=3
         )
-        ttk.Label(frame, text="分辨率:").grid(row=1, column=3, sticky="e", padx=(8, 4), pady=4)
+        ttk.Label(frame, text="分辨率:").grid(row=1, column=3, sticky="e", padx=(6, 4), pady=3)
         self.size_var = tk.StringVar(value="未知")
-        ttk.Label(frame, textvariable=self.size_var, width=14, anchor="w").grid(
-            row=1, column=4, columnspan=2, sticky="w", pady=4
+        ttk.Label(frame, textvariable=self.size_var, width=12, anchor="w").grid(
+            row=1, column=4, columnspan=2, sticky="w", pady=3
         )
-        self.connect_btn = ttk.Button(frame, text="连接", width=10, command=self.connect_device)
-        self.connect_btn.grid(row=1, column=6, padx=(4, 8), pady=4)
+        self.connect_btn = ttk.Button(frame, text="连接", width=8, command=self.connect_device)
+        self.connect_btn.grid(row=1, column=6, padx=(4, 6), pady=3)
 
         frame.columnconfigure(1, weight=1)
 
@@ -189,51 +192,54 @@ class AutoClickApp:
         :param parent: 该页的父容器。
         :return: 无返回值。
         """
+        # 参数框填满整个分页，避免窗口较大时下方留下大片空白
         box = ttk.LabelFrame(parent, text="点击参数")
-        box.pack(fill="x", padx=6, pady=4)
+        box.pack(fill="both", expand=True, padx=4, pady=(2, 2))
 
-        ttk.Label(box, text="X 坐标:").grid(row=0, column=0, sticky="w", padx=(8, 4), pady=4)
+        ttk.Label(box, text="X 坐标:").grid(row=0, column=0, sticky="w", padx=(8, 4), pady=3)
         self.qx_var = tk.StringVar(value="540")
-        ttk.Entry(box, textvariable=self.qx_var, width=12).grid(row=0, column=1, sticky="w", pady=4)
-        ttk.Label(box, text="Y 坐标:").grid(row=0, column=2, sticky="e", padx=(16, 4), pady=4)
+        ttk.Entry(box, textvariable=self.qx_var, width=11).grid(row=0, column=1, sticky="w", pady=3)
+        ttk.Label(box, text="Y 坐标:").grid(row=0, column=2, sticky="e", padx=(12, 4), pady=3)
         self.qy_var = tk.StringVar(value="1200")
-        ttk.Entry(box, textvariable=self.qy_var, width=12).grid(row=0, column=3, sticky="w", pady=4)
-        self.pick_btn = ttk.Button(box, text="拾取坐标（手机点一下）", width=22,
+        ttk.Entry(box, textvariable=self.qy_var, width=11).grid(row=0, column=3, sticky="w", pady=3)
+        self.pick_btn = ttk.Button(box, text="拾取坐标（手机点一下）", width=20,
                                    command=lambda: self.toggle_pick(self._fill_quick_xy))
-        self.pick_btn.grid(row=0, column=4, padx=(16, 8), pady=4)
+        self.pick_btn.grid(row=0, column=4, padx=(12, 6), pady=3)
         self._register_pick_button(self.pick_btn, "拾取坐标（手机点一下）")
 
-        ttk.Label(box, text="间隔(秒):").grid(row=1, column=0, sticky="w", padx=(8, 4), pady=4)
+        ttk.Label(box, text="间隔(秒):").grid(row=1, column=0, sticky="w", padx=(8, 4), pady=3)
         self.qint_var = tk.StringVar(value="0")
-        ttk.Entry(box, textvariable=self.qint_var, width=12).grid(row=1, column=1, sticky="w", pady=4)
-        ttk.Label(box, text="次数(0=无限):").grid(row=1, column=2, sticky="e", padx=(16, 4), pady=4)
+        ttk.Entry(box, textvariable=self.qint_var, width=11).grid(row=1, column=1, sticky="w", pady=3)
+        ttk.Label(box, text="次数(0=无限):").grid(row=1, column=2, sticky="e", padx=(12, 4), pady=3)
         self.qcnt_var = tk.StringVar(value="0")
-        ttk.Entry(box, textvariable=self.qcnt_var, width=12).grid(row=1, column=3, sticky="w", pady=4)
-        ttk.Label(box, text="时长(秒，空=不限):").grid(row=1, column=4, sticky="e", padx=(16, 4), pady=4)
+        ttk.Entry(box, textvariable=self.qcnt_var, width=11).grid(row=1, column=3, sticky="w", pady=3)
+        ttk.Label(box, text="时长(秒，空=不限):").grid(row=1, column=4, sticky="e", padx=(12, 4), pady=3)
         self.qdur_var = tk.StringVar(value="")
-        ttk.Entry(box, textvariable=self.qdur_var, width=10).grid(row=1, column=5, sticky="w", pady=4)
+        ttk.Entry(box, textvariable=self.qdur_var, width=9).grid(row=1, column=5, sticky="w", pady=3)
 
         actions = ttk.Frame(parent)
-        actions.pack(fill="x", padx=6, pady=(2, 4))
-        self.start_btn = ttk.Button(actions, text="开始连点", width=14, command=self.start_click)
+        actions.pack(fill="x", padx=4, pady=(0, 3))
+        self.start_btn = ttk.Button(actions, text="开始连点", width=12, command=self.start_click)
         self.start_btn.pack(side="left", padx=(0, 8))
-        self.stop_btn = ttk.Button(actions, text="停止", width=14, command=self.stop_task, state="disabled")
+        self.stop_btn = ttk.Button(actions, text="停止", width=12, command=self.stop_task, state="disabled")
         self.stop_btn.pack(side="left")
-        ttk.Label(actions, text="  提示：全速模式约 40 次/秒；间隔 0 表示全速。").pack(side="left")
+        ttk.Label(actions, text="  全速模式约 40 次/秒；间隔 0 表示全速").pack(side="left")
 
     def _build_log_area(self, parent: ttk.PanedWindow) -> None:
         """构建底部日志区（只读文本 + 滚动条 + 清空按钮）。
 
-        日志区加入垂直分割面板并可随窗口拉伸（`weight=1`），默认可显示约 16 行，
-        且用户可拖动分隔条自行放大；按钮与文本框之间不留多余空白。
+        日志区加入垂直分割面板并可随窗口拉伸（`weight=1`），默认可显示约 10 行，
+        需要更多日志时向下拖动分隔条即可放大；按钮与文本框之间不留多余空白。
 
         :param parent: 承载日志区的垂直分割面板（ttk.PanedWindow）。
         :return: 无返回值。
         """
         frame = ttk.LabelFrame(parent, text="日志")
 
-        self.log_text = tk.Text(frame, height=16, wrap="none", state="disabled",
-                                font=(UI_FONT, UI_FONT_SIZE))
+        # 日志用微软雅黑 11 号，并加一点行距，长时间查看更清晰不费眼
+        self.log_text = tk.Text(frame, height=10, wrap="none", state="disabled",
+                                font=(UI_FONT, LOG_FONT_SIZE),
+                                spacing1=1, spacing2=2, spacing3=1)
         scroll_y = ttk.Scrollbar(frame, orient="vertical", command=self.log_text.yview)
         scroll_x = ttk.Scrollbar(frame, orient="horizontal", command=self.log_text.xview)
         self.log_text.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
@@ -764,34 +770,35 @@ class AutoClickApp:
         self._param_pick_buttons: list[ttk.Button] = []
 
         info = ttk.LabelFrame(parent, text="流程信息")
-        info.pack(fill="x", padx=6, pady=(4, 2))
-        ttk.Label(info, text="名称:").grid(row=0, column=0, sticky="w", padx=(8, 4), pady=4)
+        info.pack(fill="x", padx=4, pady=(2, 1))
+        ttk.Label(info, text="名称:").grid(row=0, column=0, sticky="w", padx=(8, 4), pady=3)
         self.flow_name_var = tk.StringVar(value=self.flow.get("name", "未命名流程"))
-        ttk.Entry(info, textvariable=self.flow_name_var, width=22).grid(
-            row=0, column=1, sticky="w", pady=4)
-        ttk.Label(info, text="整体重复(0=无限):").grid(row=0, column=2, sticky="e", padx=(16, 4), pady=4)
+        ttk.Entry(info, textvariable=self.flow_name_var, width=16).grid(
+            row=0, column=1, sticky="we", pady=3)
+        ttk.Label(info, text="重复(0=∞):").grid(row=0, column=2, sticky="e", padx=(10, 4), pady=3)
         self.flow_repeat_var = tk.StringVar(
             value=str((self.flow.get("control") or {}).get("repeat", 1)))
-        ttk.Entry(info, textvariable=self.flow_repeat_var, width=6).grid(
-            row=0, column=3, sticky="w", pady=4)
+        ttk.Entry(info, textvariable=self.flow_repeat_var, width=5).grid(
+            row=0, column=3, sticky="w", pady=3)
         self.flow_stop_var = tk.BooleanVar(
             value=bool((self.flow.get("control") or {}).get("stop_on_error", True)))
         ttk.Checkbutton(info, text="出错即停止", variable=self.flow_stop_var).grid(
-            row=0, column=4, padx=(16, 8), pady=4)
-        ttk.Button(info, text="新建", width=8, command=self.new_flow).grid(
-            row=0, column=5, padx=4, pady=4)
-        ttk.Button(info, text="保存", width=8, command=self.save_flow).grid(
-            row=0, column=6, padx=4, pady=4)
-        ttk.Button(info, text="加载", width=8, command=self.load_flow).grid(
-            row=0, column=7, padx=(4, 8), pady=4)
+            row=0, column=4, padx=(10, 6), pady=3)
+        ttk.Button(info, text="新建", width=7, command=self.new_flow).grid(
+            row=0, column=5, padx=3, pady=3)
+        ttk.Button(info, text="保存", width=7, command=self.save_flow).grid(
+            row=0, column=6, padx=3, pady=3)
+        ttk.Button(info, text="加载", width=7, command=self.load_flow).grid(
+            row=0, column=7, padx=(3, 8), pady=3)
+        info.columnconfigure(1, weight=1)  # 窗口变窄时优先压缩流程名输入框
 
         body = ttk.Panedwindow(parent, orient="horizontal")
-        body.pack(fill="both", expand=True, padx=6, pady=(2, 4))
+        body.pack(fill="both", expand=True, padx=4, pady=(2, 2))
 
         left = ttk.Frame(body)
         bar = ttk.Frame(left)
         bar.pack(fill="x")
-        add_btn = ttk.Menubutton(bar, text="添加步骤 ▾", width=13)
+        add_btn = ttk.Menubutton(bar, text="添加步骤 ▾", width=11)
         add_menu = tk.Menu(add_btn, tearoff=False)
         for step_type in flowmod.STEP_TYPES:
             label = flowmod.STEP_LABELS.get(step_type, step_type)
@@ -803,18 +810,18 @@ class AutoClickApp:
                               ("复制", self.duplicate_step),
                               ("上移", lambda: self.move_step(-1)),
                               ("下移", lambda: self.move_step(1))):
-            ttk.Button(bar, text=text, width=6, command=command).pack(side="left", padx=2)
+            ttk.Button(bar, text=text, width=5, command=command).pack(side="left", padx=2)
 
         tree_wrap = ttk.Frame(left)
-        tree_wrap.pack(fill="both", expand=True, pady=(6, 0))
+        tree_wrap.pack(fill="both", expand=True, pady=(4, 0))
         self.step_tree = ttk.Treeview(tree_wrap, columns=("no", "type", "summary"),
-                                      show="headings", height=12, selectmode="browse")
+                                      show="headings", height=8, selectmode="browse")
         self.step_tree.heading("no", text="#")
-        self.step_tree.column("no", width=36, anchor="center", stretch=False)
+        self.step_tree.column("no", width=32, anchor="center", stretch=False)
         self.step_tree.heading("type", text="类型")
-        self.step_tree.column("type", width=104, stretch=False)
+        self.step_tree.column("type", width=92, stretch=False)
         self.step_tree.heading("summary", text="参数摘要")
-        self.step_tree.column("summary", width=300)
+        self.step_tree.column("summary", width=200)
         tree_scroll = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.step_tree.yview)
         self.step_tree.configure(yscrollcommand=tree_scroll.set)
         self.step_tree.pack(side="left", fill="both", expand=True)
@@ -825,19 +832,19 @@ class AutoClickApp:
         self.param_box = ttk.LabelFrame(right, text="步骤参数")
         self.param_box.pack(fill="both", expand=True)
         self.param_hint = ttk.Label(self.param_box, text="在左侧选择一个步骤后编辑参数",
-                                    foreground="#666666", justify="left", wraplength=300)
-        self.param_hint.pack(anchor="w", padx=8, pady=(6, 0))
+                                    foreground="#666666", justify="left", wraplength=230)
+        self.param_hint.pack(anchor="w", padx=8, pady=(4, 0))
         self.param_frame = ttk.Frame(self.param_box)
-        self.param_frame.pack(fill="both", expand=True, padx=8, pady=6)
+        self.param_frame.pack(fill="both", expand=True, padx=8, pady=4)
 
         body.add(left, weight=3)
         body.add(right, weight=2)
 
         bottom = ttk.Frame(parent)
-        bottom.pack(fill="x", padx=6, pady=(0, 4))
-        self.flow_start_btn = ttk.Button(bottom, text="开始执行", width=14, command=self.start_flow)
+        bottom.pack(fill="x", padx=4, pady=(0, 3))
+        self.flow_start_btn = ttk.Button(bottom, text="开始执行", width=12, command=self.start_flow)
         self.flow_start_btn.pack(side="left", padx=(0, 8))
-        self.flow_stop_btn = ttk.Button(bottom, text="停止", width=14, command=self.stop_task,
+        self.flow_stop_btn = ttk.Button(bottom, text="停止", width=12, command=self.stop_task,
                                         state="disabled")
         self.flow_stop_btn.pack(side="left")
         ttk.Label(bottom, text="  循环请成对使用「循环开始 / 循环结束」。").pack(side="left")
@@ -1358,34 +1365,34 @@ class AutoClickApp:
         :return: 无返回值。
         """
         info = ttk.LabelFrame(parent, text="录制")
-        info.pack(fill="x", padx=6, pady=(4, 2))
-        self.record_btn = ttk.Button(info, text="开始录制", width=14, command=self.start_record)
-        self.record_btn.grid(row=0, column=0, padx=(8, 6), pady=4)
-        self.record_stop_btn = ttk.Button(info, text="停止录制", width=14,
+        info.pack(fill="x", padx=4, pady=(2, 1))
+        self.record_btn = ttk.Button(info, text="开始录制", width=12, command=self.start_record)
+        self.record_btn.grid(row=0, column=0, padx=(8, 6), pady=3)
+        self.record_stop_btn = ttk.Button(info, text="停止录制", width=12,
                                           command=self.stop_record, state="disabled")
-        self.record_stop_btn.grid(row=0, column=1, padx=6, pady=4)
-        ttk.Button(info, text="清空", width=8, command=self.clear_record).grid(
-            row=0, column=2, padx=6, pady=4)
-        ttk.Button(info, text="应用到流程页", width=14, command=self.apply_record_to_flow).grid(
-            row=0, column=3, padx=6, pady=4)
+        self.record_stop_btn.grid(row=0, column=1, padx=6, pady=3)
+        ttk.Button(info, text="清空", width=7, command=self.clear_record).grid(
+            row=0, column=2, padx=6, pady=3)
+        ttk.Button(info, text="应用到流程页", width=13, command=self.apply_record_to_flow).grid(
+            row=0, column=3, padx=6, pady=3)
         ttk.Button(info, text="立即回放", width=10, command=self.replay_record).grid(
-            row=0, column=4, padx=(6, 8), pady=4)
+            row=0, column=4, padx=(6, 8), pady=3)
 
         ttk.Label(parent, text="说明：录制只记录真实手指操作（点击 / 滑动），程序注入的点击"
                                "不会进入录制流；相邻操作的间隔会自动生成「等待」步骤。",
-                  foreground="#666666", justify="left", wraplength=1000).pack(
-            anchor="w", padx=8, pady=(0, 2))
+                  foreground="#666666", justify="left", wraplength=880).pack(
+            anchor="w", padx=8, pady=(0, 1))
 
         wrap = ttk.Frame(parent)
-        wrap.pack(fill="both", expand=True, padx=6, pady=(0, 4))
+        wrap.pack(fill="both", expand=True, padx=4, pady=(0, 3))
         self.record_tree = ttk.Treeview(wrap, columns=("no", "type", "summary"),
-                                        show="headings", height=10)
+                                        show="headings", height=6)
         self.record_tree.heading("no", text="#")
-        self.record_tree.column("no", width=36, anchor="center", stretch=False)
+        self.record_tree.column("no", width=32, anchor="center", stretch=False)
         self.record_tree.heading("type", text="类型")
-        self.record_tree.column("type", width=104, stretch=False)
+        self.record_tree.column("type", width=92, stretch=False)
         self.record_tree.heading("summary", text="参数摘要")
-        self.record_tree.column("summary", width=420)
+        self.record_tree.column("summary", width=300)
         record_scroll = ttk.Scrollbar(wrap, orient="vertical", command=self.record_tree.yview)
         self.record_tree.configure(yscrollcommand=record_scroll.set)
         self.record_tree.pack(side="left", fill="both", expand=True)

@@ -157,6 +157,7 @@ class Locator:
         result = subprocess.run(
             [self.adb, "-s", self.serial, "exec-out", "cat", remote],
             capture_output=True, timeout=timeout,
+            creationflags=device.NO_WINDOW_FLAGS,  # 隐藏 cmd 窗口，与 device 层保持一致
         )
         xml = result.stdout.decode("utf-8", "replace")
         if "<hierarchy" not in xml:

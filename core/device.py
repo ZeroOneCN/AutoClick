@@ -22,6 +22,12 @@ from typing import Callable, Optional
 # 用于与手机端 shell 同步的唯一标记（不会与 input 命令的输出冲突）
 MARK = "__AUTOCLICK_TICK__"
 
+# Windows 下隐藏子进程控制台窗口的创建标志（值为 0x08000000；非 Windows 平台退化为 0）。
+# PyInstaller 以 --windowed 打包后 GUI 自身没有控制台，但每次调用 adb.exe（枚举设备、
+# 截屏、shell、getevent）都会新建一个控制台窗口，表现为黑色 cmd 一闪而过；加上该标志
+# 即可让子进程在无窗口模式下运行。所有 subprocess 调用都应带上它。
+NO_WINDOW_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
 # 常见 Android SDK platform-tools 位置（自动探测用）
 _SDK_CANDIDATES = [
     r"D:\CodeDevelop\Env\adb\adb.exe",
@@ -121,6 +127,7 @@ def run_adb(adb: str, args: list[str], timeout: float = 30.0) -> subprocess.Comp
     return subprocess.run(
         [adb, *args], capture_output=True, text=True,
         encoding="utf-8", errors="replace", timeout=timeout,
+        creationflags=NO_WINDOW_FLAGS,
     )
 
 
@@ -206,6 +213,7 @@ def screencap_png(adb: str, serial: str, timeout: float = 20.0) -> bytes:
     result = subprocess.run(
         [adb, "-s", serial, "exec-out", "screencap", "-p"],
         capture_output=True, timeout=timeout,
+        creationflags=NO_WINDOW_FLAGS,
     )
     if result.returncode != 0 or not result.stdout:
         detail = result.stderr.decode("utf-8", "replace").strip() if result.stderr else "无输出"
@@ -366,6 +374,7 @@ class TouchStream:
             [self.adb, "-s", self.serial, "shell", "getevent", "-l", self.node],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
+            creationflags=NO_WINDOW_FLAGS,
         )
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -504,6 +513,7 @@ class ShellChannel:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,  # 合并 stderr，便于把 input 的报错（如权限不足）一并捕获
             text=True, encoding="utf-8", errors="replace", bufsize=1,
+            creationflags=NO_WINDOW_FLAGS,
         )
 
     def _wait_mark(self, timeout: float = 8.0) -> tuple[str, list[str]]:

@@ -135,9 +135,17 @@ e:\Code\AutoClick\
 └───────────────────────────────────────────────────────┘
 ```
 
-界面细节：字体统一为**宋体**（`gui/app.py` 的 `UI_FONT`，同时覆盖 ttk 控件与步骤列表）；
-分页区与日志区之间是**可拖动的分隔条**，日志区默认 16 行并随窗口拉伸，需要看更多日志时
-直接往下拖分隔条即可。
+界面细节：字体统一为**微软雅黑**（`gui/app.py` 的 `UI_FONT`，覆盖 ttk 控件与步骤列表；
+日志区用 11 号并加了行距，长时间查看更清晰）。分页区与日志区之间是**可拖动的分隔条**，
+日志区默认 10 行并随窗口拉伸，需要看更多日志时往下拖即可。窗口默认 **1040x740**、
+**最小可缩到 720x540**，各页控件（adb 路径框、设备下拉、流程名输入框、步骤列表/参数区）
+都会随窗口自动收窄，支持小窗口下操作。
+
+**运行时不弹控制台窗口**：打包为 windowed EXE 后 GUI 自身没有控制台，但每次调用 `adb.exe`
+（枚举设备、截屏、shell、getevent）若不加限制会新建一个控制台窗口，表现为黑色 cmd 一闪而过。
+`core/device.py` 定义了模块级常量 `NO_WINDOW_FLAGS`（值为 `CREATE_NO_WINDOW`，非 Windows
+平台退化为 0），所有 subprocess 调用（共 5 处，含 `core/vision.py` 的控件树 dump）都带上它，
+子进程因此在无窗口模式下运行。
 
 核心层当前已具备的能力（可被后续 GUI 直接调用）：
 
@@ -202,7 +210,9 @@ e:\Code\AutoClick\
 | 坐标换算校验 | 原始 (6300, 14000) → 屏幕 (540, 1200)，换算准确 |
 | 打包产物（完整版） | `dist\AutoClick.exe` 61.5 MB（含 Python 运行时 / tkinter+tcl / OpenCV / numpy / adb 三件套） |
 | 打包产物（轻量版） | `dist\AutoClick_Lite.exe` 14.4 MB（不含 OpenCV，仅「找控件」） |
-| 免环境启动验证 | 在 PATH 移除 Python、清空 `PYTHONHOME/PYTHONPATH/ADB_PATH` 后，两个版本 GUI 均正常启动 |
+| 免环境启动验证 | 在 PATH 移除 Python、清空 `PYTHONHOME/PYTHONPATH/ADB_PATH` 后，两个版本 GUI 均正常启动（完整版最新实测启动 6.8 秒） |
+| 子进程窗口隐藏验证 | 以无控制台的 `pythonw` 作父进程对比：不带标志时 conhost 由 14 增至 15（新建了 cmd 窗口），带 `CREATE_NO_WINDOW` 时保持 14（无窗口）；打包 EXE 启动期间 conhost 13→13 |
+| 小窗口布局验证 | 720x540 下各区域正常：分页区 242px、日志区 155px；流程页步骤列表 414px / 参数区 264px；录制页列表 683px |
 
 ### 2.6 如何获取点击坐标
 
@@ -243,6 +253,7 @@ e:\Code\AutoClick\
 | 2026-10-14 | **M12 打包免环境 EXE** | 完成 | 新增 `resources\adb\`（内置 adb 三件套）、`build.spec`（PyInstaller 配置，`AUTOCLICK_LIGHT` 环境变量切换完整版/轻量版）、`build.ps1`（前置校验 → 打包 → 失败自动重试一次）；产物 `dist\AutoClick.exe`（完整版 **61.5 MB**，内置 Python 运行时 + tkinter/tcl/tk + OpenCV/numpy + adb）与 `dist\AutoClick_Lite.exe`（轻量版 **14.4 MB**，不含 OpenCV）。验证 **9/9 通过**：归档内含 adb 三件套与 `cv2.pyd`/numpy；在 PATH 移除 Python、清空 `PYTHONHOME/PYTHONPATH/ADB_PATH` 的环境下，完整版与轻量版 GUI 均能启动（窗口标题 `AutoClick - 安卓自动化工具`）；运行时解包目录存在 `resources\adb\adb.exe`（即 `bundled_adb()` 的探测路径）。首次打包曾因杀毒软件实时扫描短暂锁定输出文件导致 PE 校验和写入失败，脚本已加入重试，重跑即成功 |
 | 2026-10-14 | **重新打包交付 EXE** | 完成 | 按需重跑 `build.ps1`，重新生成 [dist/AutoClick.exe](file:///e:/Code/AutoClick/dist/AutoClick.exe)（完整版 **61.5 MB**）；在 PATH 移除 Python、清空 `PYTHONHOME/PYTHONPATH/ADB_PATH` 的环境下验证：GUI 6 秒内启动（窗口标题 `AutoClick - 安卓自动化工具`），运行时解包目录含 `resources\adb\adb.exe`；打包缓存 `build\`（68.2 MB）已清理 |
 | 2026-10-14 | **二期收尾：Git / adb 独立安装 / 界面优化** | 完成 | ① 项目纳入 Git 并推送 `https://github.com/ZeroOneCN/AutoClick.git`（新增 `.gitignore`：`build/`、`dist/` 与运行时 `flows/`、`templates/` 不入库，内置 adb 三件套入库）；② adb 三件套单独安装到 `D:\CodeDevelop\Env\adb\`（`adb version` 1.0.41 / 35.0.2，`adb devices` 正常识别 10AE5M0S53000UT），并把该路径加入 `find_adb` 常见路径探测；③ GUI 全局字体统一为**宋体**（含 ttk 控件、Treeview 行与表头，行高 24），窗口默认 1180x880、最小 1040x720；④ 分页区与日志区改为**可拖动分割面板**，日志默认 16 行并可拉伸，各页留白压缩、清空日志按钮不再独占一行；GUI 冒烟 5/5 通过（字体、日志行数、窗口尺寸、分割面板、adb 预填） |
+| 2026-10-14 | **界面体验优化 + 重新打包** | 完成 | ① **隐藏 cmd 窗口**：`core/device.py` 新增模块常量 `NO_WINDOW_FLAGS`（`CREATE_NO_WINDOW`，非 Windows 退化为 0），`run_adb` / `screencap_png` / `ShellChannel` / `TouchStream` 与 `core/vision.py` 的控件树 dump 共 5 处 subprocess 调用全部带上，消除调用 adb 时闪出的黑色控制台窗口；实测（无控制台的 `pythonw` 作父进程）：不带标志 conhost 14→15、带标志 14→14，打包 EXE 运行期间 conhost 13→13；② **字体清晰化**：界面字体由点阵式「宋体」改为带 ClearType 微调的**微软雅黑**，日志用 11 号并设 1/2/1 行距；③ **布局优化 + 小窗口支持**：分页区与日志区改按 2:1 分配，窗外边距与各页 `pady` 全面压缩，固定坐标页参数框填满整页以消除中间大片空白，窗口默认 **1040x740**、**最小 720x540**，adb 路径框 / 设备下拉 / 流程名输入框 / 步骤列表与参数区均随窗口自动收窄（720x540 实测：分页区 242px、日志区 155px、流程页列表 414px / 参数区 264px）；④ 重新打包 [dist/AutoClick.exe](file:///e:/Code/AutoClick/dist/AutoClick.exe)（61.5 MB），免 Python 环境 6.8 秒启动、运行期间无任何控制台窗口 |
 
 ### 待办 / 待确认
 
