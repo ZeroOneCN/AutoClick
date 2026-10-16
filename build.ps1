@@ -1,4 +1,4 @@
-# AutoClick 打包脚本（Windows / PowerShell）
+﻿# AutoClick 打包脚本（Windows / PowerShell）
 #
 # 用法：
 #   .\build.ps1            # 完整版：内置 OpenCV，支持「找图」，产物 dist\AutoClick.exe

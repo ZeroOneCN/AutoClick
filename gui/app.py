@@ -42,6 +42,7 @@ class AutoClickApp:
     """
 
     POLL_MS = 80  # 队列轮询间隔（毫秒）
+    MONITOR_INTERVAL = 3.0  # 设备在线状态检测间隔（秒）
 
     def __init__(self, root: tk.Tk) -> None:
         """初始化应用：构建界面并启动队列轮询。
@@ -50,8 +51,8 @@ class AutoClickApp:
         """
         self.root = root
         self.root.title("AutoClick - 安卓自动化工具")
-        self.root.geometry("1040x740")
-        self.root.minsize(720, 540)  # 支持小窗口使用：各页控件均可随之收窄
+        self.root.geometry("960x720")
+        self.root.resizable(False, False)  # 窗口固定 960x720，不允许拉伸
         self._setup_fonts()
 
         # ---- 设备状态 ----
@@ -64,6 +65,7 @@ class AutoClickApp:
         self.running = False          # 是否有连点/流程/录制任务在运行
         self.connecting = False       # 是否正在连接设备
         self.stop_event = threading.Event()
+        self.monitor_stop = threading.Event()  # 设备在线监测线程的退出信号
         self.picker: Optional[TouchStream] = None  # 坐标拾取监听器
         self.pick_handler: Optional[Callable[[int, int], None]] = None  # 拾取结果回填函数
         self._pick_buttons: list[tuple[ttk.Button, str]] = []  # (拾取按钮, 常态文案)
@@ -84,6 +86,7 @@ class AutoClickApp:
         self.root.after(self.POLL_MS, self._poll_queue)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._prefill_adb()
+        self._start_device_monitor()
         self.log("欢迎使用 AutoClick。请先点「刷新设备」并「连接」后再执行任务。")
         self.log("提示：连接安卓手机后需开启 USB 调试并在手机上同意授权。")
 
@@ -176,13 +179,14 @@ class AutoClickApp:
         ttk.Button(frame, text="刷新设备", width=9, command=self.refresh_devices).grid(
             row=1, column=2, padx=4, pady=3
         )
-        ttk.Label(frame, text="分辨率:").grid(row=1, column=3, sticky="e", padx=(6, 4), pady=3)
+        # 连接按钮紧跟「刷新设备」，方便连接后一眼看到
+        self.connect_btn = ttk.Button(frame, text="连接", width=8, command=self.connect_device)
+        self.connect_btn.grid(row=1, column=3, padx=(4, 6), pady=3)
+        ttk.Label(frame, text="分辨率:").grid(row=1, column=4, sticky="e", padx=(6, 4), pady=3)
         self.size_var = tk.StringVar(value="未知")
         ttk.Label(frame, textvariable=self.size_var, width=12, anchor="w").grid(
-            row=1, column=4, columnspan=2, sticky="w", pady=3
+            row=1, column=5, columnspan=2, sticky="w", pady=3
         )
-        self.connect_btn = ttk.Button(frame, text="连接", width=8, command=self.connect_device)
-        self.connect_btn.grid(row=1, column=6, padx=(4, 6), pady=3)
 
         frame.columnconfigure(1, weight=1)
 
@@ -236,16 +240,15 @@ class AutoClickApp:
         """
         frame = ttk.LabelFrame(parent, text="日志")
 
-        # 日志用微软雅黑 11 号，并加一点行距，长时间查看更清晰不费眼
-        self.log_text = tk.Text(frame, height=10, wrap="none", state="disabled",
+        # 日志用微软雅黑 11 号，并加一点行距，长时间查看更清晰不费眼；
+        # wrap="word" 让超长行自动折行为多行显示，无需横向滚动
+        self.log_text = tk.Text(frame, height=10, wrap="word", state="disabled",
                                 font=(UI_FONT, LOG_FONT_SIZE),
                                 spacing1=1, spacing2=2, spacing3=1)
         scroll_y = ttk.Scrollbar(frame, orient="vertical", command=self.log_text.yview)
-        scroll_x = ttk.Scrollbar(frame, orient="horizontal", command=self.log_text.xview)
-        self.log_text.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+        self.log_text.configure(yscrollcommand=scroll_y.set)
         self.log_text.grid(row=0, column=0, sticky="nsew")
         scroll_y.grid(row=0, column=1, sticky="ns")
-        scroll_x.grid(row=1, column=0, sticky="ew")
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
 
@@ -253,10 +256,10 @@ class AutoClickApp:
         self.log_text.tag_configure("warn", foreground="#ef6c00")
         self.log_text.tag_configure("ok", foreground="#2e7d32")
 
-        # 清空按钮与日志区其他控件共用网格，不再单独占一行
+        # 清空按钮改为竖排文字（自上而下读），与日志区共用网格，不单独占一行
         btn_bar = ttk.Frame(frame)
         btn_bar.grid(row=0, column=2, sticky="ns", padx=(2, 0))
-        ttk.Button(btn_bar, text="清空\n日志", width=6, command=self._clear_log).pack(side="top")
+        ttk.Button(btn_bar, text="清\n空\n日\n志", width=4, command=self._clear_log).pack(side="top")
 
         parent.add(frame, weight=1)
 
@@ -331,6 +334,8 @@ class AutoClickApp:
             self._apply_devices(payload)  # type: ignore[arg-type]
         elif kind == "connect_done":
             self._apply_connect_result(payload)  # type: ignore[arg-type]
+        elif kind == "device_state":
+            self._apply_device_state(payload)  # type: ignore[arg-type]
         elif kind == "pick":
             x, y = payload  # type: ignore[misc]
             handler, self.pick_handler = self.pick_handler, None
@@ -485,6 +490,60 @@ class AutoClickApp:
         """
         text = self.serial_var.get().strip()
         return text.split(" ")[0] if text else None
+
+    # ------------------------------------------------------------------
+    # 设备在线监测（实时测活）
+    # ------------------------------------------------------------------
+
+    def _start_device_monitor(self) -> None:
+        """启动后台线程，周期性检测已连接设备是否仍然在线。
+
+        掉线 / 恢复都会即时写日志并刷新状态栏，避免设备中断了却毫无察觉；
+        未连接设备时空转等待，不产生任何 adb 调用。
+
+        :return: 无返回值。
+        """
+        threading.Thread(target=self._device_monitor_worker, daemon=True).start()
+
+    def _device_monitor_worker(self) -> None:
+        """后台线程：每 3 秒枚举一次 adb 设备，比对当前设备的在线状态。
+
+        仅在已连接（self.serial 有值）时才执行检测；adb 瞬时异常（如 server
+        正在重启）静默跳过等下一轮，不误报掉线。状态变化通过队列交给主线程提示。
+
+        :return: 无返回值。
+        """
+        watched: Optional[str] = None
+        online = True
+        while not self.monitor_stop.wait(self.MONITOR_INTERVAL):
+            adb, serial = self.adb_path, self.serial
+            if not (adb and serial):
+                continue
+            try:
+                devices = device.list_devices(adb)
+            except Exception:
+                continue
+            if serial != watched:  # 刚连接（或换了一台设备）：重置基线，由本轮结果修正
+                watched, online = serial, True
+            now_online = any(s == serial and st == "device" for s, st in devices)
+            if now_online != online:
+                online = now_online
+                self.queue.put(("device_state", (serial, now_online)))
+
+    def _apply_device_state(self, payload: tuple) -> None:
+        """主线程：处理设备在线状态变化（掉线 / 恢复），写日志并刷新状态栏。
+
+        :param payload: (序列号, 是否在线)。
+        :return: 无返回值。
+        """
+        serial, online = payload
+        if online:
+            size = f"  {self.screen[0]}x{self.screen[1]}" if self.screen[0] else ""
+            self.status_var.set(f"已连接  {serial}{size}")
+            self.log(f"设备已恢复连接：{serial}", "ok")
+        else:
+            self.status_var.set(f"设备已断开  {serial}")
+            self.log(f"检测到设备连接断开：{serial}，请检查 USB 线与授权状态", "error")
 
     # ------------------------------------------------------------------
     # 固定坐标连点（M7 核心能力）
@@ -792,6 +851,17 @@ class AutoClickApp:
             row=0, column=7, padx=(3, 8), pady=3)
         info.columnconfigure(1, weight=1)  # 窗口变窄时优先压缩流程名输入框
 
+        # 底部「开始执行/停止」栏先用 side="bottom" 占位，再铺步骤编辑区，
+        # 保证内容再多按钮也始终可见（修复开始按钮被挤出可视区的问题）
+        bottom = ttk.Frame(parent)
+        bottom.pack(side="bottom", fill="x", padx=4, pady=(0, 3))
+        self.flow_start_btn = ttk.Button(bottom, text="开始执行", width=12, command=self.start_flow)
+        self.flow_start_btn.pack(side="left", padx=(0, 8))
+        self.flow_stop_btn = ttk.Button(bottom, text="停止", width=12, command=self.stop_task,
+                                        state="disabled")
+        self.flow_stop_btn.pack(side="left")
+        ttk.Label(bottom, text="  循环请成对使用「循环开始 / 循环结束」。").pack(side="left")
+
         body = ttk.Panedwindow(parent, orient="horizontal")
         body.pack(fill="both", expand=True, padx=4, pady=(2, 2))
 
@@ -839,15 +909,6 @@ class AutoClickApp:
 
         body.add(left, weight=3)
         body.add(right, weight=2)
-
-        bottom = ttk.Frame(parent)
-        bottom.pack(fill="x", padx=4, pady=(0, 3))
-        self.flow_start_btn = ttk.Button(bottom, text="开始执行", width=12, command=self.start_flow)
-        self.flow_start_btn.pack(side="left", padx=(0, 8))
-        self.flow_stop_btn = ttk.Button(bottom, text="停止", width=12, command=self.stop_task,
-                                        state="disabled")
-        self.flow_stop_btn.pack(side="left")
-        ttk.Label(bottom, text="  循环请成对使用「循环开始 / 循环结束」。").pack(side="left")
 
     def _sync_flow_from_ui(self) -> None:
         """把界面上的流程级参数（名称、整体重复、出错即停止）写回流程字典。
@@ -1529,6 +1590,7 @@ class AutoClickApp:
         """
         if self.running and not messagebox.askokcancel("退出", "任务正在运行，确定退出吗？"):
             return
+        self.monitor_stop.set()  # 通知在线监测线程退出
         self.stop_event.set()
         if self.recorder:
             self.recorder.stop()
