@@ -85,6 +85,12 @@ class Recorder:
     调用方可在停止后通过 `steps()` 一次性取回全部结果。
     """
 
+    # ---- 快速连点误判为滑动的两个修正参数 ----
+    JUMP_TIME = 0.025   # 相邻采样间隔小于此值视为"瞬间"（秒）；触摸屏约 60~120Hz，正常采样 8~16ms 一个点
+    JUMP_DIST = 60.0    # 一个"瞬间"内位移超过此值视为跳变（像素）；真实人手滑动 25ms 内最多移动 20~50px
+    TAP_TIME = 0.30     # 手势时长小于此值（秒）且位移不大时，即使有小幅漂移也判为点击
+    TAP_DIST = 60.0     # 配合 TAP_TIME 的位移上限（像素）；覆盖快速点击时指肚落屏滚动 20~50px 的漂移
+
     def __init__(self, adb: str, serial: str, width: int, height: int,
                  on_step: Optional[Callable[[dict], None]] = None,
                  on_log: Optional[Callable[[str, str], None]] = None,
@@ -167,6 +173,10 @@ class Recorder:
     def _on_event(self, kind: str, x: int, y: int, ts: float) -> None:
         """触摸流回调（监听线程）：累积轨迹并在手指抬起时生成步骤。
 
+        连点时手指未完全抬离屏幕，触摸屏不会上报"抬起"事件，第二次点击的坐标
+        会以 move 形式追加进当前轨迹（表现为瞬间大跳变）。这里检测到跳变时
+        先把当前轨迹收尾为一次手势，再从跳变点开始新手势，避免两击被合并成滑动。
+
         :param kind: down / move / up。
         :param x: 屏幕 X 坐标。
         :param y: 屏幕 Y 坐标。
@@ -176,6 +186,10 @@ class Recorder:
         if kind == "down":
             self._points = [(float(x), float(y), ts)]
         elif kind == "move":
+            if self._points and self._is_teleport(self._points[-1], (x, y, ts)):
+                self._finish_gesture()  # 第一击在跳变前收尾（含 gap 延时处理）
+                self._points = [(float(x), float(y), ts)]  # 第二击从这里开始
+                return
             self._points.append((float(x), float(y), ts))
         elif kind == "up":
             if not self._points:
@@ -183,6 +197,21 @@ class Recorder:
             elif (self._points[-1][0], self._points[-1][1]) != (float(x), float(y)):
                 self._points.append((float(x), float(y), ts))
             self._finish_gesture()
+
+    def _is_teleport(self, last: Point, cur: tuple[float, float, float]) -> bool:
+        """判断相邻两个采样点是否构成"瞬间大跳变"。
+
+        真实人手在屏幕上滑动时，触摸屏以 60~120Hz 持续采样，相邻点间隔 8~16ms、
+        位移一般几十像素以内；而"半抬再按下"的连点会让坐标在一个采样间隔内
+        从上一击位置直接跳到下一击位置。用「时间极短 + 位移很大」区分二者。
+
+        :param last: 轨迹中上一个采样点 (x, y, ts)。
+        :param cur: 当前采样点 (x, y, ts)。
+        :return: 构成跳变返回 True。
+        """
+        dt = cur[2] - last[2]
+        dist = _distance((last[0], last[1]), (cur[0], cur[1]))
+        return dt < self.JUMP_TIME and dist > self.JUMP_DIST
 
     def _flush_pending(self) -> None:
         """停止前把尚未结束的手势（如手指仍按在屏幕上）也转换掉。
@@ -215,7 +244,11 @@ class Recorder:
                 self._emit({"type": "sleep", "seconds": round(gap, 2)})
         self._last_end_ts = last[2]
 
-        if displacement < self.move_threshold:
+        # 点击判定：① 首尾位移小于阈值（常规点击）；
+        # ② 手势短促（< TAP_TIME 秒）且位移不大（< TAP_DIST 像素）——快速点击时
+        #    指肚落屏瞬间会滚动漂移 20~50px，短促手势不应因此误判为滑动
+        if displacement < self.move_threshold or (
+                duration_ms < self.TAP_TIME * 1000 and displacement < self.TAP_DIST):
             self._emit({"type": "tap", "x": int(round(end_xy[0])), "y": int(round(end_xy[1])),
                         "interval": 0.0, "count": 1})
             return
