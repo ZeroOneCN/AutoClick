@@ -51,8 +51,8 @@ class AutoClickApp:
         """
         self.root = root
         self.root.title("AutoClick - 安卓自动化工具")
-        self.root.geometry("960x720")
-        self.root.resizable(False, False)  # 窗口固定 960x720，不允许拉伸
+        self.root.geometry("880x660")
+        self.root.resizable(False, False)  # 窗口固定 880x660，不允许拉伸
         self._setup_fonts()
 
         # ---- 设备状态 ----
@@ -786,7 +786,8 @@ class AutoClickApp:
         blocked = self.running or self.connecting or self.recorder is not None
         state = "disabled" if blocked else "normal"
         widgets = [self.connect_btn, self.start_btn, self.pick_btn,
-                   getattr(self, "flow_start_btn", None), getattr(self, "record_btn", None)]
+                   getattr(self, "flow_start_btn", None), getattr(self, "flow_step_btn", None),
+                   getattr(self, "flow_from_btn", None), getattr(self, "record_btn", None)]
         for widget in widgets:
             if widget is None:
                 continue
@@ -855,12 +856,19 @@ class AutoClickApp:
         # 保证内容再多按钮也始终可见（修复开始按钮被挤出可视区的问题）
         bottom = ttk.Frame(parent)
         bottom.pack(side="bottom", fill="x", padx=4, pady=(0, 3))
-        self.flow_start_btn = ttk.Button(bottom, text="开始执行", width=12, command=self.start_flow)
-        self.flow_start_btn.pack(side="left", padx=(0, 8))
-        self.flow_stop_btn = ttk.Button(bottom, text="停止", width=12, command=self.stop_task,
+        self.flow_start_btn = ttk.Button(bottom, text="开始执行", width=10, command=self.start_flow)
+        self.flow_start_btn.pack(side="left", padx=(0, 4))
+        # 调试用：单步试跑 / 从选中步骤开始执行，避免改一处就要从头跑整条流程
+        self.flow_step_btn = ttk.Button(bottom, text="试跑本步", width=9,
+                                        command=self.run_selected_step)
+        self.flow_step_btn.pack(side="left", padx=4)
+        self.flow_from_btn = ttk.Button(bottom, text="从选中开始", width=11,
+                                        command=self.run_from_selected)
+        self.flow_from_btn.pack(side="left", padx=4)
+        self.flow_stop_btn = ttk.Button(bottom, text="停止", width=8, command=self.stop_task,
                                         state="disabled")
-        self.flow_stop_btn.pack(side="left")
-        ttk.Label(bottom, text="  循环请成对使用「循环开始 / 循环结束」。").pack(side="left")
+        self.flow_stop_btn.pack(side="left", padx=(4, 6))
+        ttk.Label(bottom, text="循环请成对使用「循环开始 / 循环结束」。").pack(side="left")
 
         body = ttk.Panedwindow(parent, orient="horizontal")
         body.pack(fill="both", expand=True, padx=4, pady=(2, 2))
@@ -1373,21 +1381,123 @@ class AutoClickApp:
                  f"{'无限' if not repeat else repeat} 次")
         self._launch_flow(self.flow)
 
-    def _launch_flow(self, flow: dict) -> None:
+    def run_selected_step(self) -> None:
+        """试跑选中的单个步骤（单步调试）。
+
+        只校验并执行该步骤本身，流程其它位置的问题不会阻塞本次试跑，便于"改一处验一处"。
+
+        :return: 无返回值。
+        """
+        index = self._prepare_debug_run(single=True)
+        if index is None:
+            return
+        self._launch_flow(self.flow, single=index)
+
+    def run_from_selected(self) -> None:
+        """从选中的步骤开始执行到流程末尾（调试用，仅执行 1 轮）。
+
+        与「开始执行」的区别：不从头跑、也不按流程的整体重复次数循环，
+        只把选中的这一步及其后续步骤走一遍。
+
+        :return: 无返回值。
+        """
+        index = self._prepare_debug_run()
+        if index is None:
+            return
+        depth = self._loop_depth_before(index)
+        if depth:
+            self.log(f"提示：第 {index + 1} 步位于循环体内（未闭合循环 {depth} 层），"
+                     f"从中间起跑时循环体只走一次；需要完整循环请用「开始执行」", "warn")
+        self.log(f"试跑：从第 {index + 1} 步开始执行到流程末尾（仅 1 轮）")
+        self._launch_flow(self.flow, begin=index)
+
+    def _prepare_debug_run(self, single: bool = False) -> Optional[int]:
+        """试跑前的公共准备：状态检查、参数回写、选中步骤与针对性校验。
+
+        :param single: 是否为单步试跑；单步模式只校验该步骤，中途起跑校验其后所有步骤。
+        :return: 通过校验的选中步骤下标；不满足条件时返回 None。
+        """
+        if self.running or self.connecting:
+            return None
+        if not self._require_connected():
+            return None
+        self._sync_flow_from_ui()
+        steps = self.flow.get("steps") or []
+        index = self._selected_index()
+        if index is None:
+            messagebox.showwarning("提示", "请先在左侧选择一个步骤")
+            return None
+        if index >= len(steps):
+            messagebox.showwarning("提示", "选中的步骤已不存在，请重新选择")
+            return None
+        problems = self._problems_for_run(
+            flowmod.validate_flow(self.flow, self.screen), index, single)
+        if problems:
+            for item in problems[:8]:
+                self.log(f"校验：{item}", "error")
+            messagebox.showerror("步骤校验失败", "\n".join(problems[:8]))
+            return None
+        return index
+
+    @staticmethod
+    def _problems_for_run(problems: list[str], index: int, single: bool) -> list[str]:
+        """从整条流程的校验结果中筛出与本次试跑有关的问题。
+
+        整条流程校验会连带报出被跳过部分的问题（例如前半段还有没调完的坐标），
+        这些不应该挡住"从中途开始调试"，所以只保留涉及试跑范围内步骤的问题；
+        全局性问题（如循环未闭合）交由执行引擎在运行时自行提示。
+
+        :param problems: `validate_flow` 返回的问题列表。
+        :param index: 试跑起始步骤下标（从 0 开始）。
+        :param single: 是否为单步试跑（只保留该步骤自身的问题）。
+        :return: 过滤后的问题列表。
+        """
+        kept: list[str] = []
+        for item in problems:
+            if not item.startswith("第 "):
+                continue
+            number = item[2:].split(" 步", 1)[0]
+            if not number.isdigit():
+                continue
+            step_index = int(number) - 1
+            if (step_index == index) if single else (step_index >= index):
+                kept.append(item)
+        return kept
+
+    def _loop_depth_before(self, index: int) -> int:
+        """统计指定步骤之前尚未闭合的循环层数。
+
+        :param index: 步骤下标（从 0 开始）。
+        :return: 未闭合的循环层数；0 表示该步骤不在循环体内。
+        """
+        depth = 0
+        for step in (self.flow.get("steps") or [])[:index]:
+            kind = (step or {}).get("type")
+            if kind == "loop":
+                depth += 1
+            elif kind == "endloop" and depth:
+                depth -= 1
+        return depth
+
+    def _launch_flow(self, flow: dict, begin: int = 0, single: int = -1) -> None:
         """把给定流程交给后台线程执行（含任务状态切换）。
 
         :param flow: 要执行的流程字典。
+        :param begin: 起始步骤下标（从 0 开始）；大于 0 表示调试用的中途起跑。
+        :param single: 单步试跑的步骤下标；为 -1 表示正常执行流程。
         :return: 无返回值。
         """
         self.stop_event.clear()
         self.running = True
         self._update_widget_states()
-        threading.Thread(target=self._flow_worker, args=(flow,), daemon=True).start()
+        threading.Thread(target=self._flow_worker, args=(flow, begin, single), daemon=True).start()
 
-    def _flow_worker(self, flow: dict) -> None:
+    def _flow_worker(self, flow: dict, begin: int = 0, single: int = -1) -> None:
         """后台线程：建立通道并运行流程。
 
         :param flow: 要执行的流程字典。
+        :param begin: 起始步骤下标（从 0 开始）。
+        :param single: 单步试跑的步骤下标；为 -1 表示正常执行流程。
         :return: 无返回值。
         """
         channel = None
@@ -1405,9 +1515,13 @@ class AutoClickApp:
             vision = Locator(self.adb_path, self.serial, self.screen[0], self.screen[1],
                              on_log=self.log)
             runner = flowmod.FlowRunner(flow, actions, on_log=self.log,
-                                        stop_event=self.stop_event, vision=vision)
-            ok, reason = runner.run()
-            self.log(f"流程结束：{reason}", "ok" if ok else "warn")
+                                        stop_event=self.stop_event, vision=vision, begin=begin)
+            if single >= 0:
+                ok, reason = runner.run_single(single)
+                self.log(f"单步试跑结束：{reason}", "ok" if ok else "warn")
+            else:
+                ok, reason = runner.run()
+                self.log(f"流程结束：{reason}", "ok" if ok else "warn")
         except Exception as exc:
             self.log(f"流程执行异常：{type(exc).__name__}: {exc}", "error")
         finally:

@@ -192,7 +192,7 @@ class FlowRunner:
     """
 
     def __init__(self, flow: dict, actions, on_log: Optional[Callable[[str, str], None]] = None,
-                 stop_event=None, vision=None) -> None:
+                 stop_event=None, vision=None, begin: int = 0) -> None:
         """初始化执行引擎。
 
         :param flow: 流程字典（见模块文档）。
@@ -200,6 +200,8 @@ class FlowRunner:
         :param on_log: 日志回调，签名 (文本, 级别)；级别为 info/warn/error/ok。
         :param stop_event: `threading.Event`；被 set 时尽快停止执行。
         :param vision: 识别器实例（提供 locate 方法），find_click 步骤需要；可为 None。
+        :param begin: 起始步骤下标（从 0 开始）；大于 0 时表示「从中间某步开始调试」，
+            只执行该步到末尾的一轮，忽略流程的整体重复设置。
         """
         self.flow = flow
         self.actions = actions
@@ -210,17 +212,24 @@ class FlowRunner:
         self.repeat = int(control.get("repeat", 1) or 0)
         self.stop_on_error = bool(control.get("stop_on_error", True))
         self.steps: list[dict] = [s for s in (flow.get("steps") or []) if isinstance(s, dict)]
+        self.begin = max(0, min(int(begin), len(self.steps)))  # 越界自动收敛到区间内
 
     # ---------------- 对外入口 ----------------
 
     def run(self) -> tuple[bool, str]:
         """执行整条流程（含 control.repeat 决定的整体重复）。
 
+        若构造时指定了 `begin > 0`（从中间某步开始调试），则只执行
+        [begin, 末尾) 这一轮，并忽略流程的整体重复设置，避免"调试一段却重复跑整条"。
+
         :return: (是否成功执行完毕, 结束原因描述)。
         """
         result = True
         reason = "流程执行完成"
         round_index = 0
+        if self.begin:
+            self.repeat = 1
+            self._log(f"从第 {self.begin + 1} 步开始执行（仅执行到末尾一轮，忽略整体重复）", "warn")
         while True:
             if self._stopped():
                 result, reason = False, "用户停止"
@@ -230,13 +239,39 @@ class FlowRunner:
             round_index += 1
             if self.repeat != 1:
                 self._log(f"— 开始第 {round_index} 轮" + ("（无限循环）" if not self.repeat else ""))
-            if not self._run_range(0, len(self.steps)):
+            # 第一轮从 begin 起（调试用），后续轮次按整体重复从第 1 步重新开始
+            start = self.begin if round_index == 1 else 0
+            if not self._run_range(start, len(self.steps)):
                 if self._stopped():
                     result, reason = False, "用户停止"
                 else:
                     result, reason = False, "步骤执行失败"
                 break
         return result, reason
+
+    def run_single(self, index: int) -> tuple[bool, str]:
+        """只执行指定下标的单个步骤（试跑调试用）。
+
+        结构性步骤（loop / endloop）不产生实际动作，直接返回失败并说明原因，
+        避免试跑时给出"执行成功"的误导结论。
+
+        :param index: 步骤下标（从 0 开始）。
+        :return: (是否成功, 结束原因描述)。
+        """
+        if not (0 <= index < len(self.steps)):
+            return False, "步骤下标越界"
+        step = self.steps[index]
+        kind = step.get("type")
+        if kind in ("loop", "endloop"):
+            return False, f"第 {index + 1} 步是结构性步骤（{kind}），不能单独试跑"
+        if self._stopped():
+            return False, "用户停止"
+        number = index + 1
+        self._log(f"试跑第 {number} 步：{step_summary(step)}", "warn")
+        ok, message = self._exec_step(number, step)
+        if message:
+            self._log(message, "info" if ok else "warn")
+        return (True, "试跑完成") if ok else (False, f"第 {number} 步执行失败")
 
     # ---------------- 执行细节 ----------------
 
