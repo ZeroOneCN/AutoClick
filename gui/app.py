@@ -23,6 +23,7 @@ from typing import Callable, Optional
 
 from core import device
 from core import flow as flowmod
+from core import ntp
 from core import storage
 from core.actions import Actions
 from core.device import ShellChannel, TouchStream
@@ -72,6 +73,11 @@ class AutoClickApp:
         self.monitor_stop = threading.Event()  # 设备在线监测线程的退出信号
         self.schedule_ts: Optional[float] = None  # 已设定的定时执行目标时刻（time.time() 基准）
         self.schedule_label = ""      # 定时目标的文字描述，用于倒计时显示
+        self.schedule_naive: Optional[float] = None  # 定时输入的原始时刻（未叠加网络对时偏差）
+        self.ntp_offset = 0.0         # 标准时间 − 本机时钟（秒）；由阿里云 NTP 对时更新
+        self.ntp_note = ""            # 最近一次对时结果的简短描述（用于倒计时文案）
+        self._ntp_busy = False        # 是否正在对时（避免并发重复查询）
+        self._ntp_pending_schedule = False  # 对时进行中又要求设定定时时的待办标记
         self._input_spawn_ms = 0.0    # 设备端 input 进程启动开销估计（毫秒），定时执行时测量
         self.picker: Optional[TouchStream] = None  # 坐标拾取监听器
         self.pick_handler: Optional[Callable[[int, int], None]] = None  # 拾取结果回填函数
@@ -352,6 +358,10 @@ class AutoClickApp:
             self._append_log(f"已拾取坐标: ({x}, {y})", "ok")
         elif kind == "task_end":
             self._finish_task(str(payload))
+        elif kind == "ntp":
+            self._apply_ntp_result(payload)  # type: ignore[arg-type]
+        elif kind == "schedule_target":
+            self._apply_schedule_target(payload)  # type: ignore[arg-type]
         elif kind == "template_saved":
             self._apply_template_name(payload)  # type: ignore[arg-type]
 
@@ -482,6 +492,9 @@ class AutoClickApp:
             self.size_var.set(f"{size[0]}x{size[1]}")
             self.status_var.set(f"已连接  {serial}  {size[0]}x{size[1]}")
             self.log(f"连接成功：{serial} | 分辨率 {size[0]}x{size[1]} | adb {adb}", "ok")
+            # 连接成功后自动与阿里云 NTP 对时一次：定时执行的等待基准是本机时钟，
+            # 本机时间不准会让「到点执行」整体提前或延后。
+            self.start_ntp_sync(during_schedule=False)
         else:
             self.adb_path = self.serial = None
             self.screen = (0, 0)
@@ -794,6 +807,7 @@ class AutoClickApp:
         :return: 无返回值。
         """
         self.schedule_ts = None
+        self.schedule_naive = None
         self.schedule_label = ""
         state_var = getattr(self, "schedule_state_var", None)
         if state_var is not None:
@@ -820,9 +834,10 @@ class AutoClickApp:
         self.stop_btn.configure(state="normal" if self.running else "disabled")
         schedule_cancel = getattr(self, "schedule_cancel_btn", None)
         if schedule_cancel is not None:
-            # 仅在已设定定时、等待倒计时期间可取消
+            # 对时阶段与等待倒计时期间均可取消
+            cancelable = (self.schedule_ts is not None or self.schedule_naive is not None)
             schedule_cancel.configure(
-                state="normal" if self.schedule_ts is not None and not self.connecting else "disabled")
+                state="normal" if cancelable and not self.connecting else "disabled")
         for name in ("flow_stop_btn", "record_stop_btn"):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -1525,11 +1540,79 @@ class AutoClickApp:
     # 定时执行（到点自动触发）
     # ------------------------------------------------------------------
 
+    def start_ntp_sync(self, during_schedule: bool = False) -> None:
+        """启动一次阿里云 NTP 对时（后台线程，仅校准程序内部基准，不改系统时钟）。
+
+        连接设备成功后自动调用一次；点「定时执行」时再调用一次，保证定时用的是新鲜的
+        偏差值（本机时钟可能因休眠、漂移而与标准时间拉开差距）。
+
+        :param during_schedule: 是否属于「设定定时」流程；为 True 时对时成功后会自动继续
+            设定定时（把偏差叠加到目标时刻上），为 False 时只更新界面显示。
+        :return: 无返回值。
+        """
+        if self._ntp_busy:
+            # 已有一次对时在途：把它标记为「设定定时」用途，待结果回来后再继续设定
+            if during_schedule:
+                self._ntp_pending_schedule = True
+            return
+        self._ntp_busy = True
+        if not during_schedule:
+            self.log("正在与阿里云 NTP 服务器对时…")
+        threading.Thread(target=self._ntp_worker, args=(during_schedule,), daemon=True).start()
+
+    def _ntp_worker(self, during_schedule: bool) -> None:
+        """后台线程：向阿里云 NTP 服务器对时并把结果回传主线程。
+
+        :param during_schedule: 是否属于「设定定时」流程（决定主线程的回传处理方式）。
+        :return: 无返回值。
+        """
+        try:
+            result = ntp.sync()
+        except Exception as exc:  # 任何意外都不应影响主流程
+            self.queue.put(("ntp", (False, None, f"{type(exc).__name__}: {exc}", during_schedule)))
+            return
+        if result is None:
+            self.queue.put(("ntp", (False, None, "无法连接 NTP 服务器（断网或被防火墙拦截 UDP 123）",
+                                    during_schedule)))
+            return
+        self.queue.put(("ntp", (True, result, "", during_schedule)))
+
+    def _apply_ntp_result(self, payload: tuple) -> None:
+        """主线程：应用对时结果（更新偏差值、日志与倒计时文案）。
+
+        :param payload: (成功?, ntp.SyncResult 或 None, 错误信息, 是否属于设定定时流程)。
+        :return: 无返回值。
+        """
+        ok, result, error, during_schedule = payload
+        self._ntp_busy = False
+        if self._ntp_pending_schedule:
+            # 对时在途期间用户点过「定时执行」：本次结果一并用于继续设定定时
+            during_schedule = True
+            self._ntp_pending_schedule = False
+        if not ok:
+            # 对时失败不阻断任何操作：退化为本机时钟并明确提示
+            self.ntp_offset = 0.0
+            self.ntp_note = ""
+            self.log(f"对时失败（{error}），定时执行将按本机时钟计算", "warn")
+            if during_schedule:
+                self._do_arm_schedule(offset=0.0)
+            return
+        self.ntp_offset = result.offset
+        self.ntp_note = f"已对时 {result.offset * 1000:+.0f} ms"
+        self.log(f"对时完成：{ntp.describe(result)}", "ok")
+        if during_schedule:
+            self._do_arm_schedule(offset=result.offset)
+        elif self.schedule_ts is not None and self.schedule_naive is not None:
+            # 倒计时进行中对时完成：把偏差补进已设定的目标时刻，并立即刷新文案
+            self.schedule_ts = self.schedule_naive + result.offset
+            self.root.after(0, self._schedule_tick)
+
     def arm_schedule(self) -> None:
         """校验流程与定时输入，设定到点自动执行（后台线程）。
 
         与「开始执行」共用同一套流程校验；定时输入支持 `HH:MM:SS[.毫秒]`（当天该时刻）
-        与 `+秒数`（从现在起延时）两种写法。
+        与 `+秒数`（从现在起延时）两种写法。设定前会先与阿里云 NTP 对一次时，把
+        「标准时间 − 本机时钟」的偏差叠加到目标时刻上，避免本机时钟不准导致提前/延后。
 
         :return: 无返回值。
         """
@@ -1553,16 +1636,41 @@ class AutoClickApp:
             messagebox.showwarning("提示", f"定时格式不正确。{SCHEDULE_HINT}")
             return
         target, label = parsed
-        now = time.time()
-        if target <= now:
+        # 输入的原始时刻：先做「已过去」校验（用户看到的就是这个时刻）
+        if target <= time.time():
             messagebox.showwarning("提示", "该时刻已经过去，请设置一个未来的时间")
             return
-        self.schedule_ts = target
+        self.schedule_naive = target
+        self._ntp_pending_schedule = False
         self.schedule_label = label
-        self.stop_event.clear()
         self.running = True
         self._update_widget_states()
-        self.log(f"已设定定时执行：{label}（还有 {target - now:.3f} 秒），正在预热通道…")
+        self.schedule_state_var.set("正在与阿里云 NTP 服务器对时…")
+        self.log(f"已设定定时执行：{label}，正在对时并预热通道…")
+        self.start_ntp_sync(during_schedule=True)
+
+    def _do_arm_schedule(self, offset: float) -> None:
+        """主线程：对时结束（或失败）后真正启动定时等待线程。
+
+        :param offset: 标准时间 − 本机时钟（秒）；对时失败时传 0 表示按本机时钟计算。
+        :return: 无返回值。
+        """
+        if self.schedule_naive is None:
+            # 对时期间被「取消定时」：结束本次任务并复原界面
+            self._finish_task("定时设定已取消")
+            return
+        self._ntp_pending_schedule = False
+        target = self.schedule_naive + offset
+        if target <= time.time():
+            # 设定期间时间已流逝（或本机时钟快得多），无法再等待
+            self.log("对时后发现该时刻已过，定时未生效，请重新设定", "error")
+            self._finish_task("定时未生效")
+            messagebox.showwarning("提示", "对时后发现该时刻已过，请重新设定")
+            return
+        self.schedule_ts = target
+        self.stop_event.clear()
+        self.log(f"已设定定时执行：{self.schedule_label}"
+                 f"（按标准时间还有 {target - time.time():.3f} 秒），正在预热通道…")
         # 深拷贝一份流程快照：等待期间用户若继续改步骤也不会影响本次执行
         threading.Thread(target=self._schedule_worker,
                          args=(copy.deepcopy(self.flow), target), daemon=True).start()
@@ -1573,9 +1681,10 @@ class AutoClickApp:
 
         :return: 无返回值。
         """
-        if self.schedule_ts is None:
+        if self.schedule_ts is None and self.schedule_naive is None:
             return
         self.stop_event.set()
+        self.schedule_naive = None
         self.log("已请求取消定时执行…", "warn")
 
     def _schedule_tick(self) -> None:
@@ -1587,7 +1696,9 @@ class AutoClickApp:
             return
         remain = self.schedule_ts - time.time()
         if remain > 0:
-            self.schedule_state_var.set(f"已设定 {self.schedule_label}，剩余 {remain:.1f} 秒")
+            note = f"｜{self.ntp_note}" if self.ntp_note else ""
+            self.schedule_state_var.set(
+                f"已设定 {self.schedule_label}，剩余 {remain:.1f} 秒{note}")
             self.root.after(100, self._schedule_tick)
 
     def _schedule_worker(self, flow: dict, target: float) -> None:
