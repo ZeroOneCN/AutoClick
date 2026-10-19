@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import copy
 import os
 import queue
 import threading
@@ -33,6 +34,9 @@ from core.vision import Locator
 UI_FONT = "微软雅黑"
 UI_FONT_SIZE = 10
 LOG_FONT_SIZE = 11
+
+# 定时执行输入框的格式提示（未设定定时时的默认文案）
+SCHEDULE_HINT = "格式 10:00:00.000（当天）或 +30（延时秒）"
 
 
 class AutoClickApp:
@@ -66,6 +70,9 @@ class AutoClickApp:
         self.connecting = False       # 是否正在连接设备
         self.stop_event = threading.Event()
         self.monitor_stop = threading.Event()  # 设备在线监测线程的退出信号
+        self.schedule_ts: Optional[float] = None  # 已设定的定时执行目标时刻（time.time() 基准）
+        self.schedule_label = ""      # 定时目标的文字描述，用于倒计时显示
+        self._input_spawn_ms = 0.0    # 设备端 input 进程启动开销估计（毫秒），定时执行时测量
         self.picker: Optional[TouchStream] = None  # 坐标拾取监听器
         self.pick_handler: Optional[Callable[[int, int], None]] = None  # 拾取结果回填函数
         self._pick_buttons: list[tuple[ttk.Button, str]] = []  # (拾取按钮, 常态文案)
@@ -776,7 +783,21 @@ class AutoClickApp:
         """
         self.running = False
         self.stop_event.clear()
+        self._reset_schedule_state()
         self._update_widget_states()
+
+    def _reset_schedule_state(self) -> None:
+        """清除定时执行状态与倒计时显示（主线程）。
+
+        任务结束（含被取消）时调用，使「定时执行」按钮重新可用、「取消定时」置灰。
+
+        :return: 无返回值。
+        """
+        self.schedule_ts = None
+        self.schedule_label = ""
+        state_var = getattr(self, "schedule_state_var", None)
+        if state_var is not None:
+            state_var.set(SCHEDULE_HINT)
 
     def _update_widget_states(self) -> None:
         """根据运行/连接状态统一刷新控件可用性。
@@ -787,7 +808,8 @@ class AutoClickApp:
         state = "disabled" if blocked else "normal"
         widgets = [self.connect_btn, self.start_btn, self.pick_btn,
                    getattr(self, "flow_start_btn", None), getattr(self, "flow_step_btn", None),
-                   getattr(self, "flow_from_btn", None), getattr(self, "record_btn", None)]
+                   getattr(self, "flow_from_btn", None), getattr(self, "schedule_btn", None),
+                   getattr(self, "record_btn", None)]
         for widget in widgets:
             if widget is None:
                 continue
@@ -796,6 +818,11 @@ class AutoClickApp:
             except tk.TclError:
                 pass
         self.stop_btn.configure(state="normal" if self.running else "disabled")
+        schedule_cancel = getattr(self, "schedule_cancel_btn", None)
+        if schedule_cancel is not None:
+            # 仅在已设定定时、等待倒计时期间可取消
+            schedule_cancel.configure(
+                state="normal" if self.schedule_ts is not None and not self.connecting else "disabled")
         for name in ("flow_stop_btn", "record_stop_btn"):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -850,6 +877,21 @@ class AutoClickApp:
             row=0, column=6, padx=3, pady=3)
         ttk.Button(info, text="加载", width=7, command=self.load_flow).grid(
             row=0, column=7, padx=(3, 8), pady=3)
+
+        # 到点自动触发：适用于抢购/准点类场景——提前把通道预热好并测出往返延迟，
+        # 到设定时刻立即执行，把"人的反应时间"换成机器等待。
+        ttk.Label(info, text="定时:").grid(row=1, column=0, sticky="w", padx=(8, 4), pady=3)
+        self.schedule_var = tk.StringVar(value="")
+        ttk.Entry(info, textvariable=self.schedule_var, width=16).grid(
+            row=1, column=1, sticky="we", pady=3)
+        self.schedule_btn = ttk.Button(info, text="定时执行", width=9, command=self.arm_schedule)
+        self.schedule_btn.grid(row=1, column=2, padx=(10, 3), pady=3)
+        self.schedule_cancel_btn = ttk.Button(info, text="取消定时", width=9,
+                                              command=self.cancel_schedule, state="disabled")
+        self.schedule_cancel_btn.grid(row=1, column=3, padx=3, pady=3)
+        self.schedule_state_var = tk.StringVar(value=SCHEDULE_HINT)
+        ttk.Label(info, textvariable=self.schedule_state_var, anchor="w").grid(
+            row=1, column=4, columnspan=4, sticky="we", padx=(10, 8), pady=3)
         info.columnconfigure(1, weight=1)  # 窗口变窄时优先压缩流程名输入框
 
         # 底部「开始执行/停止」栏先用 side="bottom" 占位，再铺步骤编辑区，
@@ -1478,6 +1520,243 @@ class AutoClickApp:
             elif kind == "endloop" and depth:
                 depth -= 1
         return depth
+
+    # ------------------------------------------------------------------
+    # 定时执行（到点自动触发）
+    # ------------------------------------------------------------------
+
+    def arm_schedule(self) -> None:
+        """校验流程与定时输入，设定到点自动执行（后台线程）。
+
+        与「开始执行」共用同一套流程校验；定时输入支持 `HH:MM:SS[.毫秒]`（当天该时刻）
+        与 `+秒数`（从现在起延时）两种写法。
+
+        :return: 无返回值。
+        """
+        if self.running or self.connecting:
+            return
+        if not self._require_connected():
+            return
+        self._sync_flow_from_ui()
+        steps = self.flow.get("steps") or []
+        if not steps:
+            messagebox.showwarning("提示", "流程还没有步骤，请先「添加步骤」")
+            return
+        problems = flowmod.validate_flow(self.flow, self.screen)
+        if problems:
+            for item in problems[:8]:
+                self.log(f"校验：{item}", "error")
+            messagebox.showerror("流程校验失败", "\n".join(problems[:8]))
+            return
+        parsed = self._parse_schedule_time(self.schedule_var.get())
+        if parsed is None:
+            messagebox.showwarning("提示", f"定时格式不正确。{SCHEDULE_HINT}")
+            return
+        target, label = parsed
+        now = time.time()
+        if target <= now:
+            messagebox.showwarning("提示", "该时刻已经过去，请设置一个未来的时间")
+            return
+        self.schedule_ts = target
+        self.schedule_label = label
+        self.stop_event.clear()
+        self.running = True
+        self._update_widget_states()
+        self.log(f"已设定定时执行：{label}（还有 {target - now:.3f} 秒），正在预热通道…")
+        # 深拷贝一份流程快照：等待期间用户若继续改步骤也不会影响本次执行
+        threading.Thread(target=self._schedule_worker,
+                         args=(copy.deepcopy(self.flow), target), daemon=True).start()
+        self._schedule_tick()
+
+    def cancel_schedule(self) -> None:
+        """取消已经设定的定时执行（通过停止信号让等待线程退出）。
+
+        :return: 无返回值。
+        """
+        if self.schedule_ts is None:
+            return
+        self.stop_event.set()
+        self.log("已请求取消定时执行…", "warn")
+
+    def _schedule_tick(self) -> None:
+        """主线程：定时等待期间刷新倒计时显示。
+
+        :return: 无返回值。
+        """
+        if self.schedule_ts is None:
+            return
+        remain = self.schedule_ts - time.time()
+        if remain > 0:
+            self.schedule_state_var.set(f"已设定 {self.schedule_label}，剩余 {remain:.1f} 秒")
+            self.root.after(100, self._schedule_tick)
+
+    def _schedule_worker(self, flow: dict, target: float) -> None:
+        """后台线程：预热通道 → 测出往返延迟 → 高精度等到目标时刻 → 立即执行流程。
+
+        抢购/准点类场景的胜负取决于「动作落在目标时刻」，而不是「点得多快」。
+        因此这里先把通道建好并测出往返延迟，再在 `目标时刻 - 往返延迟` 处下发命令，
+        使手机端真正动手的时刻尽量贴合用户设定的时刻（补偿传输开销）。
+
+        :param flow: 流程快照（已深拷贝）。
+        :param target: 目标时刻（time.time() 基准，秒）。
+        :return: 无返回值。
+        """
+        channel = None
+        try:
+            assert self.adb_path and self.serial
+            channel = ShellChannel(self.adb_path, self.serial)
+            status, lines = channel.handshake(6.0)
+            if status != "OK":
+                self.log(f"定时执行：无法建立通道（{status}），请重新插拔 USB 或重启 adb", "error")
+                self.queue.put(("task_end", "通道建立失败"))
+                return
+            for line in lines:
+                self.log(f"  手机端: {line}", "warn")
+            rtt_ms = self._measure_channel_rtt(channel)
+            self.log(f"通道已预热：传输延迟约 {rtt_ms:.1f} ms，"
+                     f"设备端进程启动约 {self._input_spawn_ms:.1f} ms")
+            fire_at = target - rtt_ms / 1000.0
+            if fire_at > time.time():
+                self.log(f"将在 {self._format_stamp(fire_at)} 下发命令（提前 {rtt_ms:.1f} ms 补偿传输）")
+                if not self._wait_until(fire_at):
+                    self.log("定时执行已取消", "warn")
+                    self.queue.put(("task_end", "已取消定时"))
+                    return
+            else:
+                self.log("剩余时间已不足以补偿通道延迟，立即下发", "warn")
+            deviation_ms = (time.time() - target) * 1000
+            self.log(f"开始执行（下发时刻与目标偏差 {deviation_ms:+.1f} ms；"
+                     f"手机端首步动作预计再晚约 {self._input_spawn_ms:.0f} ms）", "ok")
+            actions = Actions(channel)
+            vision = Locator(self.adb_path, self.serial, self.screen[0], self.screen[1],
+                             on_log=self.log)
+            runner = flowmod.FlowRunner(flow, actions, on_log=self.log,
+                                        stop_event=self.stop_event, vision=vision)
+            ok, reason = runner.run()
+            self.log(f"流程结束：{reason}", "ok" if ok else "warn")
+        except Exception as exc:
+            self.log(f"定时执行异常：{type(exc).__name__}: {exc}", "error")
+        finally:
+            if channel is not None:
+                channel.close()
+        self.queue.put(("task_end", "定时任务结束"))
+
+    def _measure_channel_rtt(self, channel: ShellChannel, samples: int = 5) -> float:
+        """测量通道往返延迟的中位数（毫秒），用于定时执行的提前量补偿。
+
+        用 `true` 这类无副作用命令测量：它只包含 adb 传输与 shell 命令框架开销，
+        不含设备端 `input` 进程的启动时间——后者由 `_measure_input_spawn` 单独测。
+
+        :param channel: 已握手的 shell 通道。
+        :param samples: 采样次数；取中位数以避开偶发抖动。
+        :return: 往返延迟毫秒数；全部采样失败时返回 0.0。
+        """
+        values: list[float] = []
+        for _ in range(samples):
+            elapsed, status, _ = channel.command("true")
+            if status != "OK":
+                break
+            values.append(elapsed)
+        self._input_spawn_ms = 0.0
+        if not values:
+            return 0.0
+        values.sort()
+        median = values[len(values) // 2]
+        self._input_spawn_ms = self._measure_input_spawn(channel, median)
+        return median
+
+    @staticmethod
+    def _measure_input_spawn(channel: ShellChannel, baseline_ms: float) -> float:
+        """估算设备端启动一次 `input` 命令的额外开销（毫秒）。
+
+        用无副作用的 `input keyevent 0`（0 号键码无动作）代替真实点击来测量：
+        它与 `input tap` 走同一条进程启动路径，只比 `true` 多出进程启动时间。
+        若设备不支持该命令，则退化为 0（不额外提示）。
+
+        :param channel: 已握手的 shell 通道。
+        :param baseline_ms: 无副作用命令的往返延迟（毫秒），用作扣减基线。
+        :return: 额外启动开销毫秒数；无法测量时返回 0.0。
+        """
+        values: list[float] = []
+        for _ in range(3):
+            elapsed, status, lines = channel.command("input keyevent 0")
+            if status != "OK" or any("Error" in line or "error" in line for line in lines):
+                return 0.0
+            values.append(elapsed)
+        if not values:
+            return 0.0
+        values.sort()
+        return max(0.0, values[len(values) // 2] - baseline_ms)
+
+    def _wait_until(self, target: float) -> bool:
+        """高精度等待到指定时间戳。
+
+        先粗睡、再细睡，最后约 2ms 自旋，规避系统 sleep 粒度带来的十几毫秒误差；
+        等待期间持续响应「停止 / 取消定时」。
+
+        :param target: 目标时间戳（time.time() 基准，秒）。
+        :return: 到达目标返回 True；被取消返回 False。
+        """
+        while True:
+            if self.stop_event.is_set():
+                return False
+            remain = target - time.time()
+            if remain <= 0:
+                return True
+            if remain > 0.05:
+                time.sleep(min(remain - 0.02, 0.05))
+            elif remain > 0.002:
+                time.sleep(0.001)
+            else:
+                while time.time() < target:
+                    if self.stop_event.is_set():
+                        return False
+
+    @staticmethod
+    def _parse_schedule_time(text: str) -> Optional[tuple[float, str]]:
+        """解析定时输入文本。
+
+        支持 `HH:MM:SS[.毫秒]`（当天该时刻）与 `+秒数`（从现在起延时）两种写法。
+
+        :param text: 用户输入的文本。
+        :return: (目标时间戳, 可读描述)；格式不正确时返回 None。
+        """
+        text = (text or "").strip()
+        if not text:
+            return None
+        if text.startswith("+"):
+            try:
+                seconds = float(text[1:])
+            except ValueError:
+                return None
+            if seconds <= 0:
+                return None
+            return time.time() + seconds, f"延时 {seconds:g} 秒"
+        parts = text.split(":")
+        if len(parts) not in (2, 3):
+            return None
+        try:
+            hour = int(parts[0])
+            minute = int(parts[1])
+            second = float(parts[2]) if len(parts) == 3 else 0.0
+        except ValueError:
+            return None
+        if not (0 <= hour < 24 and 0 <= minute < 60 and 0 <= second < 60):
+            return None
+        now = time.localtime()
+        whole = int(second)
+        stamp = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, hour, minute, whole,
+                             now.tm_wday, now.tm_yday, -1)) + (second - whole)
+        return stamp, f"{hour:02d}:{minute:02d}:{second:06.3f}"
+
+    @staticmethod
+    def _format_stamp(stamp: float) -> str:
+        """把时间戳格式化为 `HH:MM:SS.mmm`。
+
+        :param stamp: time.time() 基准的时间戳。
+        :return: 形如 `10:00:00.250` 的字符串。
+        """
+        return time.strftime("%H:%M:%S", time.localtime(stamp)) + f".{int(stamp % 1 * 1000):03d}"
 
     def _launch_flow(self, flow: dict, begin: int = 0, single: int = -1) -> None:
         """把给定流程交给后台线程执行（含任务状态切换）。
