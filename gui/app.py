@@ -236,10 +236,8 @@ class AutoClickApp:
 
         actions = ttk.Frame(parent)
         actions.pack(fill="x", padx=4, pady=(0, 3))
-        self.start_btn = ttk.Button(actions, text="开始连点", width=12, command=self.start_click)
+        self.start_btn = ttk.Button(actions, text="开始连点", width=12, command=self.toggle_click)
         self.start_btn.pack(side="left", padx=(0, 8))
-        self.stop_btn = ttk.Button(actions, text="停止", width=12, command=self.stop_task, state="disabled")
-        self.stop_btn.pack(side="left")
         ttk.Label(actions, text="  全速模式约 40 次/秒；间隔 0 表示全速").pack(side="left")
 
     def _build_log_area(self, parent: ttk.PanedWindow) -> None:
@@ -778,6 +776,31 @@ class AutoClickApp:
     # 任务状态与控件联动
     # ------------------------------------------------------------------
 
+    def toggle_click(self) -> None:
+        """连点页「开始/停止」切换按钮的点击处理。
+
+        未运行则启动连点；正在运行（含定时等待、试跑）则请求停止，实现一个按钮
+        点击切换两种状态。
+
+        :return: 无返回值。
+        """
+        if self.running:
+            self.stop_task()
+        else:
+            self.start_click()
+
+    def toggle_flow(self) -> None:
+        """流程编排页「开始执行/停止」切换按钮的点击处理。
+
+        未运行则按流程页设置开始执行；正在运行（含试跑、定时等待）则请求停止。
+
+        :return: 无返回值。
+        """
+        if self.running:
+            self.stop_task()
+        else:
+            self.start_flow()
+
     def stop_task(self) -> None:
         """请求停止当前任务（连点/流程/录制）。
 
@@ -813,6 +836,24 @@ class AutoClickApp:
         if state_var is not None:
             state_var.set(SCHEDULE_HINT)
 
+    def _refresh_toggle_buttons(self) -> None:
+        """刷新「开始/停止」切换按钮的文案与可用状态。
+
+        未运行时显示「开始…」并可点击（连接中或录制中置灰）；运行中显示「停止」，
+        任何时候都能点（用于中断任务）。
+
+        :return: 无返回值。
+        """
+        idle_state = "disabled" if (self.connecting or self.recorder is not None) else "normal"
+        start_btn = getattr(self, "start_btn", None)
+        if start_btn is not None:
+            start_btn.configure(text="停止" if self.running else "开始连点",
+                                state="normal" if self.running else idle_state)
+        flow_btn = getattr(self, "flow_start_btn", None)
+        if flow_btn is not None:
+            flow_btn.configure(text="停止" if self.running else "开始执行",
+                               state="normal" if self.running else idle_state)
+
     def _update_widget_states(self) -> None:
         """根据运行/连接状态统一刷新控件可用性。
 
@@ -820,10 +861,9 @@ class AutoClickApp:
         """
         blocked = self.running or self.connecting or self.recorder is not None
         state = "disabled" if blocked else "normal"
-        widgets = [self.connect_btn, self.start_btn, self.pick_btn,
-                   getattr(self, "flow_start_btn", None), getattr(self, "flow_step_btn", None),
-                   getattr(self, "flow_from_btn", None), getattr(self, "schedule_btn", None),
-                   getattr(self, "record_btn", None)]
+        widgets = [self.connect_btn, self.pick_btn,
+                   getattr(self, "flow_step_btn", None), getattr(self, "flow_from_btn", None),
+                   getattr(self, "schedule_btn", None), getattr(self, "record_btn", None)]
         for widget in widgets:
             if widget is None:
                 continue
@@ -831,23 +871,18 @@ class AutoClickApp:
                 widget.configure(state=state)
             except tk.TclError:
                 pass
-        self.stop_btn.configure(state="normal" if self.running else "disabled")
+        # 「开始/停止」为同一个按钮：运行中变成「停止」仍可点击，非运行期间按
+        # 连接/录制状态置灰
+        self._refresh_toggle_buttons()
         schedule_cancel = getattr(self, "schedule_cancel_btn", None)
         if schedule_cancel is not None:
             # 对时阶段与等待倒计时期间均可取消
             cancelable = (self.schedule_ts is not None or self.schedule_naive is not None)
             schedule_cancel.configure(
                 state="normal" if cancelable and not self.connecting else "disabled")
-        for name in ("flow_stop_btn", "record_stop_btn"):
-            widget = getattr(self, name, None)
-            if widget is not None:
-                widget.configure(state="disabled")
         record_stop = getattr(self, "record_stop_btn", None)
         if record_stop is not None:
             record_stop.configure(state="normal" if self.recorder else "disabled")
-        flow_stop = getattr(self, "flow_stop_btn", None)
-        if flow_stop is not None:
-            flow_stop.configure(state="normal" if self.running else "disabled")
 
     def _require_connected(self) -> bool:
         """检查设备是否已连接。
@@ -909,11 +944,11 @@ class AutoClickApp:
             row=1, column=4, columnspan=4, sticky="we", padx=(10, 8), pady=3)
         info.columnconfigure(1, weight=1)  # 窗口变窄时优先压缩流程名输入框
 
-        # 底部「开始执行/停止」栏先用 side="bottom" 占位，再铺步骤编辑区，
+        # 底部「开始执行/停止（同键切换）」栏先用 side="bottom" 占位，再铺步骤编辑区，
         # 保证内容再多按钮也始终可见（修复开始按钮被挤出可视区的问题）
         bottom = ttk.Frame(parent)
         bottom.pack(side="bottom", fill="x", padx=4, pady=(0, 3))
-        self.flow_start_btn = ttk.Button(bottom, text="开始执行", width=10, command=self.start_flow)
+        self.flow_start_btn = ttk.Button(bottom, text="开始执行", width=10, command=self.toggle_flow)
         self.flow_start_btn.pack(side="left", padx=(0, 4))
         # 调试用：单步试跑 / 从选中步骤开始执行，避免改一处就要从头跑整条流程
         self.flow_step_btn = ttk.Button(bottom, text="试跑本步", width=9,
@@ -922,9 +957,6 @@ class AutoClickApp:
         self.flow_from_btn = ttk.Button(bottom, text="从选中开始", width=11,
                                         command=self.run_from_selected)
         self.flow_from_btn.pack(side="left", padx=4)
-        self.flow_stop_btn = ttk.Button(bottom, text="停止", width=8, command=self.stop_task,
-                                        state="disabled")
-        self.flow_stop_btn.pack(side="left", padx=(4, 6))
         ttk.Label(bottom, text="循环请成对使用「循环开始 / 循环结束」。").pack(side="left")
 
         body = ttk.Panedwindow(parent, orient="horizontal")
