@@ -7,9 +7,10 @@ __pycache__/
 build/
 dist/
 
-# 运行时自动创建的用户数据（流程 JSON / 找图模板）
+# 运行时自动创建的用户数据（流程 JSON / 找图模板 / 连点参数预加载）
 flows/
 templates/
+config/
 
 # 编辑器与日志
 .idea/

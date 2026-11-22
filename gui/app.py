@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 import queue
 import threading
@@ -38,6 +39,51 @@ LOG_FONT_SIZE = 11
 
 # 定时执行输入框的格式提示（未设定定时时的默认文案）
 SCHEDULE_HINT = "格式 10:00:00.000（当天）或 +30（延时秒）"
+
+# 连点页参数的首次预置值：坐标预加载为常用点位，不必每次启动都重新拾取；
+# 之后每次点「开始连点」都会把当前参数存盘，下次启动自动预加载上次用的值。
+QUICK_DEFAULT = {"x": "485", "y": "2200", "interval": "0", "count": "0", "duration": ""}
+
+
+def quick_config_path() -> str:
+    """返回连点参数预加载文件的路径（用户数据目录下的 config/quick_click.json）。
+
+    :return: 配置文件绝对路径。
+    """
+    return os.path.join(device.app_dir(), "config", "quick_click.json")
+
+
+def load_quick_params() -> dict:
+    """读取上次使用的连点参数；文件不存在或损坏时回退到预置值。
+
+    :return: 含 x / y / interval / count / duration 五项字符串的参数字典。
+    """
+    data = dict(QUICK_DEFAULT)
+    try:
+        with open(quick_config_path(), "r", encoding="utf-8") as fp:
+            saved = json.load(fp)
+    except (OSError, ValueError):
+        return data
+    if isinstance(saved, dict):
+        for key in data:
+            if key in saved and saved[key] is not None:
+                data[key] = str(saved[key])
+    return data
+
+
+def save_quick_params(params: dict) -> None:
+    """把当前连点参数存盘，供下次启动预加载（失败时静默忽略，不影响点击）。
+
+    :param params: 含 x / y / interval / count / duration 的参数字典。
+    :return: 无返回值。
+    """
+    try:
+        device.ensure_dir(os.path.dirname(quick_config_path()))
+        with open(quick_config_path(), "w", encoding="utf-8") as fp:
+            json.dump({key: str(params.get(key, "")) for key in QUICK_DEFAULT},
+                      fp, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
 
 
 class AutoClickApp:
@@ -213,11 +259,13 @@ class AutoClickApp:
         box = ttk.LabelFrame(parent, text="点击参数")
         box.pack(fill="both", expand=True, padx=4, pady=(2, 2))
 
+        # 预加载上次使用的连点参数（首次运行用预置坐标 485,2200）
+        quick = load_quick_params()
         ttk.Label(box, text="X 坐标:").grid(row=0, column=0, sticky="w", padx=(8, 4), pady=3)
-        self.qx_var = tk.StringVar(value="540")
+        self.qx_var = tk.StringVar(value=quick["x"])
         ttk.Entry(box, textvariable=self.qx_var, width=11).grid(row=0, column=1, sticky="w", pady=3)
         ttk.Label(box, text="Y 坐标:").grid(row=0, column=2, sticky="e", padx=(12, 4), pady=3)
-        self.qy_var = tk.StringVar(value="1200")
+        self.qy_var = tk.StringVar(value=quick["y"])
         ttk.Entry(box, textvariable=self.qy_var, width=11).grid(row=0, column=3, sticky="w", pady=3)
         self.pick_btn = ttk.Button(box, text="拾取坐标（手机点一下）", width=20,
                                    command=lambda: self.toggle_pick(self._fill_quick_xy))
@@ -225,13 +273,13 @@ class AutoClickApp:
         self._register_pick_button(self.pick_btn, "拾取坐标（手机点一下）")
 
         ttk.Label(box, text="间隔(秒):").grid(row=1, column=0, sticky="w", padx=(8, 4), pady=3)
-        self.qint_var = tk.StringVar(value="0")
+        self.qint_var = tk.StringVar(value=quick["interval"])
         ttk.Entry(box, textvariable=self.qint_var, width=11).grid(row=1, column=1, sticky="w", pady=3)
         ttk.Label(box, text="次数(0=无限):").grid(row=1, column=2, sticky="e", padx=(12, 4), pady=3)
-        self.qcnt_var = tk.StringVar(value="0")
+        self.qcnt_var = tk.StringVar(value=quick["count"])
         ttk.Entry(box, textvariable=self.qcnt_var, width=11).grid(row=1, column=3, sticky="w", pady=3)
         ttk.Label(box, text="时长(秒，空=不限):").grid(row=1, column=4, sticky="e", padx=(12, 4), pady=3)
-        self.qdur_var = tk.StringVar(value="")
+        self.qdur_var = tk.StringVar(value=quick["duration"])
         ttk.Entry(box, textvariable=self.qdur_var, width=9).grid(row=1, column=5, sticky="w", pady=3)
 
         actions = ttk.Frame(parent)
@@ -601,6 +649,13 @@ class AutoClickApp:
         self.stop_event.clear()
         self.running = True
         self._update_widget_states()
+        # 记住本次参数，下次启动自动预加载（免去每次都重新拾取坐标）
+        save_quick_params({
+            "x": str(x), "y": str(y),
+            "interval": self.qint_var.get().strip() or "0",
+            "count": self.qcnt_var.get().strip() or "0",
+            "duration": duration_text,
+        })
         plan = f"持续 {duration:g} 秒" if duration is not None else (
             f"共 {count} 次" if count else "不限次数（点「停止」结束）")
         pace = f"间隔 {interval:g}s" if interval > 0 else "全速"

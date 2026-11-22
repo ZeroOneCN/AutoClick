@@ -213,6 +213,7 @@ class FlowRunner:
         self.stop_on_error = bool(control.get("stop_on_error", True))
         self.steps: list[dict] = [s for s in (flow.get("steps") or []) if isinstance(s, dict)]
         self.begin = max(0, min(int(begin), len(self.steps)))  # 越界自动收敛到区间内
+        self._started_at = 0.0  # 本次执行开始时刻（time.time() 基准），用于统计轮次耗时
 
     # ---------------- 对外入口 ----------------
 
@@ -227,6 +228,7 @@ class FlowRunner:
         result = True
         reason = "流程执行完成"
         round_index = 0
+        self._started_at = time.time()
         if self.begin:
             self.repeat = 1
             self._log(f"从第 {self.begin + 1} 步开始执行（仅执行到末尾一轮，忽略整体重复）", "warn")
@@ -238,7 +240,15 @@ class FlowRunner:
                 break
             round_index += 1
             if self.repeat != 1:
-                self._log(f"— 开始第 {round_index} 轮" + ("（无限循环）" if not self.repeat else ""))
+                # 整体重复（含「重复 0 = 无限」）时，每轮开头都给醒目的轮次标记，
+                # 便于在大量日志中定位当前跑到第几轮、已耗时多久。
+                elapsed = time.time() - self._started_at
+                if self.repeat:
+                    self._log(f"===== 第 {round_index}/{self.repeat} 轮开始"
+                              f"（已运行 {elapsed:.1f} 秒）=====")
+                else:
+                    self._log(f"===== 第 {round_index} 轮开始"
+                              f"（无限重复，已运行 {elapsed:.1f} 秒，点「停止」结束）=====")
             # 第一轮从 begin 起（调试用），后续轮次按整体重复从第 1 步重新开始
             start = self.begin if round_index == 1 else 0
             if not self._run_range(start, len(self.steps)):
@@ -247,6 +257,9 @@ class FlowRunner:
                 else:
                     result, reason = False, "步骤执行失败"
                 break
+        if round_index > 1:
+            self._log(f"流程结束：共执行 {round_index} 轮，耗时 "
+                      f"{time.time() - self._started_at:.1f} 秒", "ok")
         return result, reason
 
     def run_single(self, index: int) -> tuple[bool, str]:
@@ -358,6 +371,9 @@ class FlowRunner:
             if not self._run_range(begin, end):
                 return False
             done += 1
+            if not times:
+                # 无限循环时逐次播报，避免"跑着但看不出跑到第几轮"
+                self._log(f"↻ 循环第 {done} 次（无限循环，点「停止」结束）")
         return True
 
     def _exec_step(self, number: int, step: dict) -> tuple[bool, str]:
