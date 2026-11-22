@@ -19,10 +19,13 @@ find_click / loop / endloop`。
 - `loop` 与 `endloop` **成对出现**，二者之间（不含标记）的步骤为循环体；
 - `loop` 字段：`mode` = `count`（按次数）或 `duration`（按时长）、`times`（次数，0 表示无限）、
   `duration`（秒）；支持嵌套 loop（按配对关系递归执行）。
-- 整条流程的重复由 `control.repeat` 控制（0 表示无限）。
+- 整条流程的重复由 `control.repeat` 控制（0 表示无限）；`control.retry` 为每步失败后的
+  重试次数（0 表示不重试，单步可用 `retry` 字段覆盖）；`control.jitter` 为等待时长与
+  点击间隔的随机浮动比例（0~1，0 表示关闭抖动）。
 """
 from __future__ import annotations
 
+import random
 import time
 from typing import Callable, Optional
 
@@ -211,6 +214,10 @@ class FlowRunner:
         control = flow.get("control") or {}
         self.repeat = int(control.get("repeat", 1) or 0)
         self.stop_on_error = bool(control.get("stop_on_error", True))
+        # 步骤失败自动重试次数（0 = 不重试）与步骤间隔随机抖动比例（0 = 关闭）。
+        # 抖动让节奏不再恒定，既避免固定频率被识别，也能避开"每次都撞同一个空档"。
+        self.retry = max(0, int(control.get("retry", 1) or 0))
+        self.jitter = min(1.0, max(0.0, float(control.get("jitter", 0.2) or 0)))
         self.steps: list[dict] = [s for s in (flow.get("steps") or []) if isinstance(s, dict)]
         self.begin = max(0, min(int(begin), len(self.steps)))  # 越界自动收敛到区间内
         self._started_at = 0.0  # 本次执行开始时刻（time.time() 基准），用于统计轮次耗时
@@ -383,7 +390,7 @@ class FlowRunner:
         :param step: 步骤字典。
         :return: (是否成功, 日志文本)。
         """
-        retry = int(step.get("retry", 0) or 0)
+        retry = int(step.get("retry", self.retry) or 0)
         for attempt in range(retry + 1):
             if self._stopped():
                 return False, "已停止"
@@ -391,10 +398,23 @@ class FlowRunner:
             if ok:
                 return True, f"[{number}] {message}"
             if attempt < retry:
-                self._log(f"[{number}] 失败：{message}，重试 {attempt + 1}/{retry}", "warn")
-                if self._sleep(0.5):
+                # 重试前等待带随机抖动，避免每次都在同一时间点重撞
+                wait = self._jittered(0.5)
+                self._log(f"[{number}] 失败：{message}，{wait:.2f}s 后重试 "
+                          f"{attempt + 1}/{retry}", "warn")
+                if self._sleep(wait):
                     return False, "已停止"
         return False, f"[{number}] {message}"
+
+    def _jittered(self, seconds: float) -> float:
+        """按 `control.jitter` 比例给等待时长加随机抖动。
+
+        :param seconds: 原始等待秒数。
+        :return: 抖动后的秒数（jitter 为 0 或时长非正时原样返回）。
+        """
+        if self.jitter <= 0 or seconds <= 0:
+            return seconds
+        return max(0.0, seconds * (1.0 + random.uniform(-self.jitter, self.jitter)))
 
     def _do_step(self, step: dict) -> tuple[bool, str]:
         """按类型执行一步具体动作。
@@ -416,11 +436,11 @@ class FlowRunner:
                 int(src[0]), int(src[1]), int(dst[0]), int(dst[1]), int(step.get("duration", 300)))
             return status == "OK", f"滑动 {tuple(src)} → {tuple(dst)}"
         if kind == "sleep":
-            seconds = float(step.get("seconds", 0) or 0)
-            self._log(f"等待 {seconds}s…")
+            seconds = self._jittered(float(step.get("seconds", 0) or 0))
+            self._log(f"等待 {seconds:.2f}s…")
             if self._sleep(seconds):
                 return False, "已停止"
-            return True, f"等待 {seconds}s 完成"
+            return True, f"等待 {seconds:.2f}s 完成"
         if kind == "text":
             _, status, _ = self.actions.text(str(step.get("value", "")))
             return status == "OK", f"输入文本 '{step.get('value')}'"
@@ -453,7 +473,7 @@ class FlowRunner:
             if lines:
                 self._log(f"  手机端: {lines[:3]}", "warn")
             done += 1
-            if interval > 0 and self._sleep(interval):
+            if interval > 0 and self._sleep(self._jittered(interval)):
                 return False, f"点击已停止（已完成 {done} 次）"
         return True, f"点击 ({x}, {y}) × {done} 次"
 

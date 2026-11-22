@@ -124,6 +124,8 @@ class AutoClickApp:
         self.ntp_note = ""            # 最近一次对时结果的简短描述（用于倒计时文案）
         self._ntp_busy = False        # 是否正在对时（避免并发重复查询）
         self._ntp_pending_schedule = False  # 对时进行中又要求设定定时时的待办标记
+        self._log_records: list[tuple[str, str, str]] = []  # 全量日志（时间, 正文, 级别），供过滤与导出
+        self.hotkey = None            # 全局急停热键对象（Windows 下可用）
         self._input_spawn_ms = 0.0    # 设备端 input 进程启动开销估计（毫秒），定时执行时测量
         self.picker: Optional[TouchStream] = None  # 坐标拾取监听器
         self.pick_handler: Optional[Callable[[int, int], None]] = None  # 拾取结果回填函数
@@ -146,8 +148,43 @@ class AutoClickApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._prefill_adb()
         self._start_device_monitor()
+        self._setup_hotkey()
         self.log("欢迎使用 AutoClick。请先点「刷新设备」并「连接」后再执行任务。")
         self.log("提示：连接安卓手机后需开启 USB 调试并在手机上同意授权。")
+
+    def _setup_hotkey(self) -> None:
+        """注册全局急停热键 F12（窗口失焦 / 被遮挡时同样生效）。
+
+        热键回调只往队列投递消息，由主线程统一处理，避免跨线程操作控件。
+
+        :return: 无返回值。
+        """
+        if os.name != "nt":
+            return
+        try:
+            from core.hotkey import VK_F12, GlobalHotkey
+        except Exception as exc:  # 极端情况下 Win32 API 不可用，不影响主功能
+            self.log(f"全局急停热键不可用：{exc}", "warn")
+            return
+        self.hotkey = GlobalHotkey(VK_F12, lambda: self.queue.put(("hotkey", None)))
+        if self.hotkey.start():
+            self.log("已启用全局急停热键 F12：任何时刻按下即中断当前任务")
+        else:
+            self.log(f"全局急停热键注册失败：{self.hotkey.error}；仍可在界面点「停止」", "warn")
+
+    def _on_hotkey(self) -> None:
+        """主线程处理急停热键：中断运行中的任务或录制。
+
+        :return: 无返回值。
+        """
+        if self.running:
+            self.log("收到急停热键 F12，正在中断任务…", "warn")
+            self.stop_task()
+        elif self.recorder is not None:
+            self.log("收到急停热键 F12，正在停止录制…", "warn")
+            self.stop_record()
+        else:
+            self.log("收到急停热键 F12，但当前没有运行中的任务", "warn")
 
     # ------------------------------------------------------------------
     # 界面构建
@@ -320,6 +357,15 @@ class AutoClickApp:
         btn_bar.grid(row=0, column=2, sticky="ns", padx=(2, 0))
         ttk.Button(btn_bar, text="清\n空\n日\n志", width=4, command=self._clear_log).pack(side="top")
 
+        # 底部工具条：导出日志 / 只看关键（轮次与错误）/ 急停热键提示
+        foot = ttk.Frame(frame)
+        foot.grid(row=1, column=0, columnspan=3, sticky="ew", padx=4, pady=(2, 2))
+        ttk.Button(foot, text="导出日志", width=9, command=self.export_log).pack(side="left")
+        self.log_key_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(foot, text="只看轮次/错误", variable=self.log_key_only,
+                        command=self._render_logs).pack(side="left", padx=(10, 0))
+        ttk.Label(foot, text="全局急停：F12").pack(side="right")
+
         parent.add(frame, weight=1)
 
     # ------------------------------------------------------------------
@@ -335,25 +381,94 @@ class AutoClickApp:
         """
         self.queue.put(("log", (text, level)))
 
+    @staticmethod
+    def _is_key_log(text: str, level: str) -> bool:
+        """判断一条日志是否属于「关键日志」（轮次标记、结束汇总或异常提示）。
+
+        :param text: 日志正文。
+        :param level: 日志级别。
+        :return: 关键日志返回 True，普通过程日志返回 False。
+        """
+        if level in ("warn", "error", "ok"):
+            return True
+        return (text.startswith("=====") or text.startswith("↻")
+                or text.startswith("流程结束：") or text.startswith("开始连点"))
+
     def _append_log(self, text: str, level: str) -> None:
-        """主线程内把日志追加到文本框（带时间戳）。
+        """主线程内把日志追加到文本框（带时间戳），同时缓存到全量记录。
 
         :param text: 日志正文。
         :param level: 日志级别。
         :return: 无返回值。
         """
         stamp = time.strftime("%H:%M:%S")
+        self._log_records.append((stamp, text, level))
+        if len(self._log_records) > 5000:  # 防止长时间运行吃内存
+            del self._log_records[:1000]
+        flag = getattr(self, "log_key_only", None)
+        if flag is not None and flag.get() and not self._is_key_log(text, level):
+            return
+        self._write_log_line(stamp, text, level)
+
+    def _write_log_line(self, stamp: str, text: str, level: str) -> None:
+        """把一行日志写入文本框并滚动到底部。
+
+        :param stamp: 已格式化的时间戳。
+        :param text: 日志正文。
+        :param level: 日志级别（决定着色标签）。
+        :return: 无返回值。
+        """
         tag = "" if level == "info" else level
         self.log_text.configure(state="normal")
         self.log_text.insert("end", f"[{stamp}] {text}\n", tag)
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
-    def _clear_log(self) -> None:
-        """清空日志区内容。
+    def _render_logs(self) -> None:
+        """按当前「只看轮次/错误」开关重绘整个日志区。
 
         :return: 无返回值。
         """
+        only_key = bool(getattr(self, "log_key_only", None) and self.log_key_only.get())
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        for stamp, text, level in self._log_records:
+            if only_key and not self._is_key_log(text, level):
+                continue
+            tag = "" if level == "info" else level
+            self.log_text.insert("end", f"[{stamp}] {text}\n", tag)
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def export_log(self) -> None:
+        """把全量日志导出为文本文件（UTF-8 带 BOM，记事本直接可读）。
+
+        :return: 无返回值。
+        """
+        if not self._log_records:
+            messagebox.showinfo("提示", "当前没有日志可导出")
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出日志", defaultextension=".txt",
+            initialfile=time.strftime("autoclick_log_%Y%m%d_%H%M%S.txt"),
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8-sig") as fp:
+                for stamp, text, level in self._log_records:
+                    fp.write(f"[{stamp}] {text}\n")
+        except OSError as exc:
+            messagebox.showerror("导出失败", f"无法写入文件：{exc}")
+            return
+        self.log(f"日志已导出：{path}（共 {len(self._log_records)} 条）", "ok")
+
+    def _clear_log(self) -> None:
+        """清空日志区内容与全量日志缓存。
+
+        :return: 无返回值。
+        """
+        self._log_records.clear()
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
@@ -404,6 +519,8 @@ class AutoClickApp:
             self._append_log(f"已拾取坐标: ({x}, {y})", "ok")
         elif kind == "task_end":
             self._finish_task(str(payload))
+        elif kind == "hotkey":
+            self._on_hotkey()
         elif kind == "ntp":
             self._apply_ntp_result(payload)  # type: ignore[arg-type]
         elif kind == "schedule_target":
@@ -965,23 +1082,34 @@ class AutoClickApp:
         info.pack(fill="x", padx=4, pady=(2, 1))
         ttk.Label(info, text="名称:").grid(row=0, column=0, sticky="w", padx=(8, 4), pady=3)
         self.flow_name_var = tk.StringVar(value=self.flow.get("name", "未命名流程"))
-        ttk.Entry(info, textvariable=self.flow_name_var, width=16).grid(
+        ttk.Entry(info, textvariable=self.flow_name_var, width=13).grid(
             row=0, column=1, sticky="we", pady=3)
-        ttk.Label(info, text="重复(0=∞):").grid(row=0, column=2, sticky="e", padx=(10, 4), pady=3)
+        ttk.Label(info, text="重复(0=∞):").grid(row=0, column=2, sticky="e", padx=(8, 4), pady=3)
         self.flow_repeat_var = tk.StringVar(
             value=str((self.flow.get("control") or {}).get("repeat", 1)))
-        ttk.Entry(info, textvariable=self.flow_repeat_var, width=5).grid(
+        ttk.Entry(info, textvariable=self.flow_repeat_var, width=4).grid(
             row=0, column=3, sticky="w", pady=3)
+        # 失败自动重试次数与步骤间隔随机抖动比例（0 = 关闭）
+        ttk.Label(info, text="重试:").grid(row=0, column=4, sticky="e", padx=(8, 4), pady=3)
+        self.flow_retry_var = tk.StringVar(
+            value=str((self.flow.get("control") or {}).get("retry", 1)))
+        ttk.Entry(info, textvariable=self.flow_retry_var, width=3).grid(
+            row=0, column=5, sticky="w", pady=3)
+        ttk.Label(info, text="抖动:").grid(row=0, column=6, sticky="e", padx=(8, 4), pady=3)
+        self.flow_jitter_var = tk.StringVar(
+            value=str((self.flow.get("control") or {}).get("jitter", 0.2)))
+        ttk.Entry(info, textvariable=self.flow_jitter_var, width=4).grid(
+            row=0, column=7, sticky="w", pady=3)
         self.flow_stop_var = tk.BooleanVar(
             value=bool((self.flow.get("control") or {}).get("stop_on_error", True)))
         ttk.Checkbutton(info, text="出错即停止", variable=self.flow_stop_var).grid(
-            row=0, column=4, padx=(10, 6), pady=3)
-        ttk.Button(info, text="新建", width=7, command=self.new_flow).grid(
-            row=0, column=5, padx=3, pady=3)
-        ttk.Button(info, text="保存", width=7, command=self.save_flow).grid(
-            row=0, column=6, padx=3, pady=3)
-        ttk.Button(info, text="加载", width=7, command=self.load_flow).grid(
-            row=0, column=7, padx=(3, 8), pady=3)
+            row=0, column=8, padx=(8, 4), pady=3)
+        ttk.Button(info, text="新建", width=6, command=self.new_flow).grid(
+            row=0, column=9, padx=2, pady=3)
+        ttk.Button(info, text="保存", width=6, command=self.save_flow).grid(
+            row=0, column=10, padx=2, pady=3)
+        ttk.Button(info, text="加载", width=6, command=self.load_flow).grid(
+            row=0, column=11, padx=(2, 8), pady=3)
 
         # 到点自动触发：适用于抢购/准点类场景——提前把通道预热好并测出往返延迟，
         # 到设定时刻立即执行，把"人的反应时间"换成机器等待。
@@ -1072,7 +1200,17 @@ class AutoClickApp:
             repeat = int(self.flow_repeat_var.get().strip() or "0")
         except ValueError:
             repeat = 1
+        try:
+            retry = max(0, int(self.flow_retry_var.get().strip() or "0"))
+        except ValueError:
+            retry = 1
+        try:
+            jitter = float(self.flow_jitter_var.get().strip() or "0")
+        except ValueError:
+            jitter = 0.2
         self.flow["control"] = {"repeat": max(0, repeat),
+                                "retry": retry,
+                                "jitter": min(1.0, max(0.0, jitter)),
                                 "stop_on_error": bool(self.flow_stop_var.get())}
 
     def _apply_flow_to_ui(self) -> None:
@@ -1083,6 +1221,8 @@ class AutoClickApp:
         self.flow_name_var.set(self.flow.get("name", "未命名流程"))
         control = self.flow.get("control") or {}
         self.flow_repeat_var.set(str(control.get("repeat", 1)))
+        self.flow_retry_var.set(str(control.get("retry", 1)))
+        self.flow_jitter_var.set(str(control.get("jitter", 0.2)))
         self.flow_stop_var.set(bool(control.get("stop_on_error", True)))
         self._refresh_step_tree()
         self._clear_param_fields()
@@ -2136,7 +2276,8 @@ class AutoClickApp:
         self.flow = {"name": "录制流程",
                      "screen": {"width": self.screen[0], "height": self.screen[1]},
                      "steps": [dict(step) for step in self.recorded_steps],
-                     "control": {"repeat": 1, "stop_on_error": True}}
+                     "control": {"repeat": 1, "retry": 1, "jitter": 0.2,
+                                 "stop_on_error": True}}
         self.flow_path = None
         self._apply_flow_to_ui()
         self.tabs.select(self.flow_tab)
@@ -2160,7 +2301,8 @@ class AutoClickApp:
         flow = {"name": "录制回放",
                 "screen": {"width": self.screen[0], "height": self.screen[1]},
                 "steps": [dict(step) for step in self.recorded_steps],
-                "control": {"repeat": 1, "stop_on_error": True}}
+                "control": {"repeat": 1, "retry": 1, "jitter": 0.2,
+                            "stop_on_error": True}}
         problems = flowmod.validate_flow(flow, self.screen)
         if problems:
             for item in problems[:8]:
@@ -2183,6 +2325,11 @@ class AutoClickApp:
             return
         self.monitor_stop.set()  # 通知在线监测线程退出
         self.stop_event.set()
+        if self.hotkey is not None:  # 注销全局热键，避免退出后按键仍占用
+            try:
+                self.hotkey.stop()
+            except Exception:
+                pass
         if self.recorder:
             self.recorder.stop()
             self.recorder = None
