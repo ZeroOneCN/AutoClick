@@ -126,6 +126,7 @@ class AutoClickApp:
         self._ntp_pending_schedule = False  # 对时进行中又要求设定定时时的待办标记
         self._log_records: list[tuple[str, str, str]] = []  # 全量日志（时间, 正文, 级别），供过滤与导出
         self.hotkey = None            # 全局急停热键对象（Windows 下可用）
+        self.current_runner = None    # 当前流程执行器（供「暂停/继续」控制）
         self._input_spawn_ms = 0.0    # 设备端 input 进程启动开销估计（毫秒），定时执行时测量
         self.picker: Optional[TouchStream] = None  # 坐标拾取监听器
         self.pick_handler: Optional[Callable[[int, int], None]] = None  # 拾取结果回填函数
@@ -521,6 +522,10 @@ class AutoClickApp:
             self._finish_task(str(payload))
         elif kind == "hotkey":
             self._on_hotkey()
+        elif kind == "runner_ready":
+            # 工作线程建好执行器后交给主线程，使「暂停/继续」能作用到正在跑的对象
+            self.current_runner = payload
+            self._update_pause_button()
         elif kind == "ntp":
             self._apply_ntp_result(payload)  # type: ignore[arg-type]
         elif kind == "schedule_target":
@@ -973,6 +978,43 @@ class AutoClickApp:
         else:
             self.start_flow()
 
+    def toggle_pause_flow(self) -> None:
+        """流程编排页「暂停/继续」切换按钮的处理。
+
+        暂停只挂起执行、不结束任务：当前轮次与步骤位置都保留，点「继续」后从
+        原处接着跑，轮数不会从头开始。
+
+        :return: 无返回值。
+        """
+        runner = self.current_runner
+        if runner is None or not self.running:
+            return
+        if runner.paused:
+            runner.resume()
+            self.log(f"已继续执行（回到第 {runner.round_index} 轮，第 "
+                     f"{runner.current_step} 步）", "ok")
+        else:
+            runner.pause()
+            where = f"第 {runner.round_index} 轮" if runner.round_index else "启动阶段"
+            if runner.current_step:
+                where += f"，第 {runner.current_step} 步"
+            self.log(f"已暂停（{where}）；点「继续」从当前位置接着跑，轮次不变", "warn")
+        self._update_pause_button()
+
+    def _update_pause_button(self) -> None:
+        """按当前执行器状态刷新「暂停/继续」按钮的文案与可用性。
+
+        :return: 无返回值。
+        """
+        btn = getattr(self, "flow_pause_btn", None)
+        if btn is None:
+            return
+        runner = self.current_runner
+        if not self.running or runner is None:
+            btn.configure(text="暂停", state="disabled")
+            return
+        btn.configure(text="继续" if runner.paused else "暂停", state="normal")
+
     def stop_task(self) -> None:
         """请求停止当前任务（连点/流程/录制）。
 
@@ -991,6 +1033,7 @@ class AutoClickApp:
         """
         self.running = False
         self.stop_event.clear()
+        self.current_runner = None  # 执行器已结束，回收「暂停/继续」目标
         self._reset_schedule_state()
         self._update_widget_states()
 
@@ -1025,6 +1068,7 @@ class AutoClickApp:
         if flow_btn is not None:
             flow_btn.configure(text="停止" if self.running else "开始执行",
                                state="normal" if self.running else idle_state)
+        self._update_pause_button()
 
     def _update_widget_states(self) -> None:
         """根据运行/连接状态统一刷新控件可用性。
@@ -1133,6 +1177,9 @@ class AutoClickApp:
         bottom.pack(side="bottom", fill="x", padx=4, pady=(0, 3))
         self.flow_start_btn = ttk.Button(bottom, text="开始执行", width=10, command=self.toggle_flow)
         self.flow_start_btn.pack(side="left", padx=(0, 4))
+        self.flow_pause_btn = ttk.Button(bottom, text="暂停", width=7,
+                                         command=self.toggle_pause_flow, state="disabled")
+        self.flow_pause_btn.pack(side="left", padx=(0, 2))
         # 调试用：单步试跑 / 从选中步骤开始执行，避免改一处就要从头跑整条流程
         self.flow_step_btn = ttk.Button(bottom, text="试跑本步", width=9,
                                         command=self.run_selected_step)
@@ -1970,6 +2017,7 @@ class AutoClickApp:
                              on_log=self.log)
             runner = flowmod.FlowRunner(flow, actions, on_log=self.log,
                                         stop_event=self.stop_event, vision=vision)
+            self.queue.put(("runner_ready", runner))  # 交给主线程，供「暂停/继续」控制
             ok, reason = runner.run()
             self.log(f"流程结束：{reason}", "ok" if ok else "warn")
         except Exception as exc:
@@ -2133,6 +2181,7 @@ class AutoClickApp:
                              on_log=self.log)
             runner = flowmod.FlowRunner(flow, actions, on_log=self.log,
                                         stop_event=self.stop_event, vision=vision, begin=begin)
+            self.queue.put(("runner_ready", runner))  # 交给主线程，供「暂停/继续」控制
             if single >= 0:
                 ok, reason = runner.run_single(single)
                 self.log(f"单步试跑结束：{reason}", "ok" if ok else "warn")

@@ -26,6 +26,7 @@ find_click / loop / endloop`。
 from __future__ import annotations
 
 import random
+import threading
 import time
 from typing import Callable, Optional
 
@@ -221,6 +222,55 @@ class FlowRunner:
         self.steps: list[dict] = [s for s in (flow.get("steps") or []) if isinstance(s, dict)]
         self.begin = max(0, min(int(begin), len(self.steps)))  # 越界自动收敛到区间内
         self._started_at = 0.0  # 本次执行开始时刻（time.time() 基准），用于统计轮次耗时
+        self._pause = threading.Event()  # set 表示处于暂停状态（不是停止，可继续）
+        self.round_index = 0             # 当前轮次（供界面显示「暂停于第 N 轮」）
+        self.current_step = 0            # 当前步骤序号（从 1 开始，暂停时用于定位）
+
+    # ---------------- 暂停 / 继续 ----------------
+
+    def pause(self) -> None:
+        """请求暂停：在下一个步骤边界或等待片段处挂起，不丢失当前轮次与步骤。
+
+        :return: 无返回值。
+        """
+        self._pause.set()
+
+    def resume(self) -> None:
+        """继续执行：从暂停的位置接着跑，轮次与步骤序号保持不变。
+
+        :return: 无返回值。
+        """
+        self._pause.clear()
+
+    def toggle_pause(self) -> bool:
+        """切换暂停/继续状态。
+
+        :return: 切换后是否处于暂停状态（True = 已暂停）。
+        """
+        if self._pause.is_set():
+            self._pause.clear()
+            return False
+        self._pause.set()
+        return True
+
+    @property
+    def paused(self) -> bool:
+        """当前是否处于暂停状态。
+
+        :return: 暂停中返回 True。
+        """
+        return self._pause.is_set()
+
+    def _wait_while_paused(self) -> bool:
+        """暂停期间挂起当前线程，直到继续或被停止。
+
+        :return: 继续执行返回 True；期间收到停止请求返回 False。
+        """
+        while self._pause.is_set():
+            if self._stopped():
+                return False
+            time.sleep(0.05)
+        return not self._stopped()
 
     # ---------------- 对外入口 ----------------
 
@@ -246,6 +296,7 @@ class FlowRunner:
             if self.repeat and round_index >= self.repeat:
                 break
             round_index += 1
+            self.round_index = round_index  # 供界面显示暂停时的轮次
             if self.repeat != 1:
                 # 整体重复（含「重复 0 = 无限」）时，每轮开头都给醒目的轮次标记，
                 # 便于在大量日志中定位当前跑到第几轮、已耗时多久。
@@ -304,6 +355,9 @@ class FlowRunner:
         """
         index = begin
         while index < end:
+            # 步骤边界处检查暂停：挂起期间不推进任何步骤，继续后从当前步接着跑
+            if not self._wait_while_paused():
+                return False
             if self._stopped():
                 return False
             step = self.steps[index]
@@ -322,6 +376,7 @@ class FlowRunner:
                 index += 1
                 continue
             ok, message = self._exec_step(index + 1, step)
+            self.current_step = index + 1  # 记录当前位置，暂停时可提示「停在第 N 步」
             if message:
                 self._log(message, "info" if ok else "warn")
             if not ok:
@@ -366,6 +421,12 @@ class FlowRunner:
             while time.perf_counter() < deadline:
                 if self._stopped():
                     return False
+                # 暂停期间把计时终点顺延，避免"暂停也在耗时长"
+                if self._pause.is_set():
+                    pause_start = time.perf_counter()
+                    if not self._wait_while_paused():
+                        return False
+                    deadline += time.perf_counter() - pause_start
                 if not self._run_range(begin, end):
                     return False
             return True
@@ -512,7 +573,18 @@ class FlowRunner:
         if self.stop_event is None:
             time.sleep(seconds)
             return False
-        return self.stop_event.wait(seconds)
+        # 分段等待：暂停期间不计入剩余时间，继续后把没睡完的部分补上
+        remaining = seconds
+        while remaining > 0:
+            if self._pause.is_set():
+                if not self._wait_while_paused():
+                    return True
+                continue
+            chunk = min(remaining, 0.05)
+            if self.stop_event.wait(chunk):
+                return True
+            remaining -= chunk
+        return self._stopped()
 
     def _stopped(self) -> bool:
         """判断是否收到停止请求。
