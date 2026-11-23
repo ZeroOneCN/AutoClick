@@ -212,6 +212,8 @@ class AutoClickApp:
         # 适当加大行高，避免中文行贴在一起
         style.configure("Treeview", font=(UI_FONT, UI_FONT_SIZE), rowheight=24)
         style.configure("Treeview.Heading", font=(UI_FONT, UI_FONT_SIZE))
+        # 主操作按钮（开始执行 / 开始连点 / 应用修改）用加粗字重区分出层次
+        style.configure("Primary.TButton", font=(UI_FONT, UI_FONT_SIZE, "bold"))
 
     def _build_ui(self) -> None:
         """构建主界面骨架：设备栏 + 分页区 + 底部按钮 + 日志区。
@@ -322,14 +324,15 @@ class AutoClickApp:
 
         actions = ttk.Frame(parent)
         actions.pack(fill="x", padx=4, pady=(0, 3))
-        self.start_btn = ttk.Button(actions, text="开始连点", width=12, command=self.toggle_click)
+        self.start_btn = ttk.Button(actions, text="开始连点", width=12,
+                                    style="Primary.TButton", command=self.toggle_click)
         self.start_btn.pack(side="left", padx=(0, 8))
         ttk.Label(actions, text="  全速模式约 40 次/秒；间隔 0 表示全速").pack(side="left")
 
     def _build_log_area(self, parent: ttk.PanedWindow) -> None:
         """构建底部日志区（只读文本 + 滚动条 + 清空按钮）。
 
-        日志区加入垂直分割面板并可随窗口拉伸（`weight=1`），默认可显示约 10 行，
+        日志区加入垂直分割面板并可随窗口拉伸（`weight=1`），默认可显示约 7 行，
         需要更多日志时向下拖动分隔条即可放大；按钮与文本框之间不留多余空白。
 
         :param parent: 承载日志区的垂直分割面板（ttk.PanedWindow）。
@@ -339,7 +342,7 @@ class AutoClickApp:
 
         # 日志用微软雅黑 11 号，并加一点行距，长时间查看更清晰不费眼；
         # wrap="word" 让超长行自动折行为多行显示，无需横向滚动
-        self.log_text = tk.Text(frame, height=10, wrap="word", state="disabled",
+        self.log_text = tk.Text(frame, height=7, wrap="word", state="disabled",
                                 font=(UI_FONT, LOG_FONT_SIZE),
                                 spacing1=1, spacing2=2, spacing3=1)
         scroll_y = ttk.Scrollbar(frame, orient="vertical", command=self.log_text.yview)
@@ -353,18 +356,16 @@ class AutoClickApp:
         self.log_text.tag_configure("warn", foreground="#ef6c00")
         self.log_text.tag_configure("ok", foreground="#2e7d32")
 
-        # 清空按钮改为竖排文字（自上而下读），与日志区共用网格，不单独占一行
-        btn_bar = ttk.Frame(frame)
-        btn_bar.grid(row=0, column=2, sticky="ns", padx=(2, 0))
-        ttk.Button(btn_bar, text="清\n空\n日\n志", width=4, command=self._clear_log).pack(side="top")
-
-        # 底部工具条：导出日志 / 只看关键（轮次与错误）/ 急停热键提示
+        # 底部工具条：清空 / 导出 / 只看关键（轮次与错误）/ 急停热键提示。
+        # 清空按钮改为常规横排放进工具条——原来的竖排四字按钮在日志区高度不足时会被裁切。
         foot = ttk.Frame(frame)
-        foot.grid(row=1, column=0, columnspan=3, sticky="ew", padx=4, pady=(2, 2))
-        ttk.Button(foot, text="导出日志", width=9, command=self.export_log).pack(side="left")
+        foot.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(3, 3))
+        ttk.Button(foot, text="清空日志", width=9, command=self._clear_log).pack(side="left")
+        ttk.Button(foot, text="导出日志", width=9, command=self.export_log).pack(
+            side="left", padx=(6, 0))
         self.log_key_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(foot, text="只看轮次/错误", variable=self.log_key_only,
-                        command=self._render_logs).pack(side="left", padx=(10, 0))
+                        command=self._render_logs).pack(side="left", padx=(12, 0))
         ttk.Label(foot, text="全局急停：F12").pack(side="right")
 
         parent.add(frame, weight=1)
@@ -1121,61 +1122,67 @@ class AutoClickApp:
         :return: 无返回值。
         """
         self._param_pick_buttons: list[ttk.Button] = []
+        self._param_action_buttons: list[ttk.Widget] = []  # 当前步骤专属动作按钮（换步骤时销毁重建）
 
         info = ttk.LabelFrame(parent, text="流程信息")
         info.pack(fill="x", padx=4, pady=(2, 1))
-        ttk.Label(info, text="名称:").grid(row=0, column=0, sticky="w", padx=(8, 4), pady=3)
+        # 两行各自独立成 Frame：若共用同一个 grid，两行的列宽会互相撑开，
+        # 表现为「重复」与「重试」之间出现莫名大空隙、定时行把上面挤歪。
+        row_a = ttk.Frame(info)
+        row_a.pack(fill="x", padx=4, pady=(3, 1))
+        ttk.Label(row_a, text="名称:").grid(row=0, column=0, sticky="w", padx=(4, 4))
         self.flow_name_var = tk.StringVar(value=self.flow.get("name", "未命名流程"))
-        ttk.Entry(info, textvariable=self.flow_name_var, width=13).grid(
-            row=0, column=1, sticky="we", pady=3)
-        ttk.Label(info, text="重复(0=∞):").grid(row=0, column=2, sticky="e", padx=(8, 4), pady=3)
-        self.flow_repeat_var = tk.StringVar(
-            value=str((self.flow.get("control") or {}).get("repeat", 1)))
-        ttk.Entry(info, textvariable=self.flow_repeat_var, width=4).grid(
-            row=0, column=3, sticky="w", pady=3)
+        ttk.Entry(row_a, textvariable=self.flow_name_var, width=16).grid(
+            row=0, column=1, sticky="w")
+        ttk.Label(row_a, text="重复(0=∞):").grid(row=0, column=2, sticky="e", padx=(12, 4))
+        control = self.flow.get("control") or {}
+        self.flow_repeat_var = tk.StringVar(value=str(control.get("repeat", 1)))
+        ttk.Entry(row_a, textvariable=self.flow_repeat_var, width=4).grid(
+            row=0, column=3, sticky="w")
         # 失败自动重试次数与步骤间隔随机抖动比例（0 = 关闭）
-        ttk.Label(info, text="重试:").grid(row=0, column=4, sticky="e", padx=(8, 4), pady=3)
-        self.flow_retry_var = tk.StringVar(
-            value=str((self.flow.get("control") or {}).get("retry", 1)))
-        ttk.Entry(info, textvariable=self.flow_retry_var, width=3).grid(
-            row=0, column=5, sticky="w", pady=3)
-        ttk.Label(info, text="抖动:").grid(row=0, column=6, sticky="e", padx=(8, 4), pady=3)
-        self.flow_jitter_var = tk.StringVar(
-            value=str((self.flow.get("control") or {}).get("jitter", 0.2)))
-        ttk.Entry(info, textvariable=self.flow_jitter_var, width=4).grid(
-            row=0, column=7, sticky="w", pady=3)
-        self.flow_stop_var = tk.BooleanVar(
-            value=bool((self.flow.get("control") or {}).get("stop_on_error", True)))
-        ttk.Checkbutton(info, text="出错即停止", variable=self.flow_stop_var).grid(
-            row=0, column=8, padx=(8, 4), pady=3)
-        ttk.Button(info, text="新建", width=6, command=self.new_flow).grid(
-            row=0, column=9, padx=2, pady=3)
-        ttk.Button(info, text="保存", width=6, command=self.save_flow).grid(
-            row=0, column=10, padx=2, pady=3)
-        ttk.Button(info, text="加载", width=6, command=self.load_flow).grid(
-            row=0, column=11, padx=(2, 8), pady=3)
+        ttk.Label(row_a, text="重试:").grid(row=0, column=4, sticky="e", padx=(12, 4))
+        self.flow_retry_var = tk.StringVar(value=str(control.get("retry", 1)))
+        ttk.Entry(row_a, textvariable=self.flow_retry_var, width=4).grid(
+            row=0, column=5, sticky="w")
+        ttk.Label(row_a, text="抖动:").grid(row=0, column=6, sticky="e", padx=(10, 4))
+        self.flow_jitter_var = tk.StringVar(value=str(control.get("jitter", 0.2)))
+        ttk.Entry(row_a, textvariable=self.flow_jitter_var, width=5).grid(
+            row=0, column=7, sticky="w")
+        self.flow_stop_var = tk.BooleanVar(value=bool(control.get("stop_on_error", True)))
+        ttk.Checkbutton(row_a, text="出错即停止", variable=self.flow_stop_var).grid(
+            row=0, column=8, padx=(12, 8))
+        ttk.Button(row_a, text="新建", width=6, command=self.new_flow).grid(
+            row=0, column=9, padx=2)
+        ttk.Button(row_a, text="保存", width=6, command=self.save_flow).grid(
+            row=0, column=10, padx=2)
+        ttk.Button(row_a, text="加载", width=6, command=self.load_flow).grid(
+            row=0, column=11, padx=(2, 4))
+        row_a.columnconfigure(12, weight=1)  # 末尾弹性列：控件保持紧凑左对齐，不被拉散
 
         # 到点自动触发：适用于抢购/准点类场景——提前把通道预热好并测出往返延迟，
         # 到设定时刻立即执行，把"人的反应时间"换成机器等待。
-        ttk.Label(info, text="定时:").grid(row=1, column=0, sticky="w", padx=(8, 4), pady=3)
+        row_b = ttk.Frame(info)
+        row_b.pack(fill="x", padx=4, pady=(1, 3))
+        ttk.Label(row_b, text="定时:").grid(row=0, column=0, sticky="w", padx=(4, 4))
         self.schedule_var = tk.StringVar(value="")
-        ttk.Entry(info, textvariable=self.schedule_var, width=16).grid(
-            row=1, column=1, sticky="we", pady=3)
-        self.schedule_btn = ttk.Button(info, text="定时执行", width=9, command=self.arm_schedule)
-        self.schedule_btn.grid(row=1, column=2, padx=(10, 3), pady=3)
-        self.schedule_cancel_btn = ttk.Button(info, text="取消定时", width=9,
+        ttk.Entry(row_b, textvariable=self.schedule_var, width=18).grid(
+            row=0, column=1, sticky="w")
+        self.schedule_btn = ttk.Button(row_b, text="定时执行", width=9, command=self.arm_schedule)
+        self.schedule_btn.grid(row=0, column=2, padx=(10, 3))
+        self.schedule_cancel_btn = ttk.Button(row_b, text="取消定时", width=9,
                                               command=self.cancel_schedule, state="disabled")
-        self.schedule_cancel_btn.grid(row=1, column=3, padx=3, pady=3)
+        self.schedule_cancel_btn.grid(row=0, column=3, padx=3)
         self.schedule_state_var = tk.StringVar(value=SCHEDULE_HINT)
-        ttk.Label(info, textvariable=self.schedule_state_var, anchor="w").grid(
-            row=1, column=4, columnspan=4, sticky="we", padx=(10, 8), pady=3)
-        info.columnconfigure(1, weight=1)  # 窗口变窄时优先压缩流程名输入框
+        ttk.Label(row_b, textvariable=self.schedule_state_var, anchor="w").grid(
+            row=0, column=4, sticky="w", padx=(10, 4))
+        row_b.columnconfigure(5, weight=1)
 
         # 底部「开始执行/停止（同键切换）」栏先用 side="bottom" 占位，再铺步骤编辑区，
         # 保证内容再多按钮也始终可见（修复开始按钮被挤出可视区的问题）
         bottom = ttk.Frame(parent)
         bottom.pack(side="bottom", fill="x", padx=4, pady=(0, 3))
-        self.flow_start_btn = ttk.Button(bottom, text="开始执行", width=10, command=self.toggle_flow)
+        self.flow_start_btn = ttk.Button(bottom, text="开始执行", width=10,
+                                         style="Primary.TButton", command=self.toggle_flow)
         self.flow_start_btn.pack(side="left", padx=(0, 4))
         self.flow_pause_btn = ttk.Button(bottom, text="暂停", width=7,
                                          command=self.toggle_pause_flow, state="disabled")
@@ -1192,9 +1199,9 @@ class AutoClickApp:
         body = ttk.Panedwindow(parent, orient="horizontal")
         body.pack(fill="both", expand=True, padx=4, pady=(2, 2))
 
-        left = ttk.Frame(body)
+        left = ttk.LabelFrame(body, text="步骤列表")
         bar = ttk.Frame(left)
-        bar.pack(fill="x")
+        bar.pack(fill="x", padx=2, pady=(2, 0))
         add_btn = ttk.Menubutton(bar, text="添加步骤 ▾", width=11)
         add_menu = tk.Menu(add_btn, tearoff=False)
         for step_type in flowmod.STEP_TYPES:
@@ -1210,15 +1217,15 @@ class AutoClickApp:
             ttk.Button(bar, text=text, width=5, command=command).pack(side="left", padx=2)
 
         tree_wrap = ttk.Frame(left)
-        tree_wrap.pack(fill="both", expand=True, pady=(4, 0))
+        tree_wrap.pack(fill="both", expand=True, padx=2, pady=(4, 2))
         self.step_tree = ttk.Treeview(tree_wrap, columns=("no", "type", "summary"),
                                       show="headings", height=8, selectmode="browse")
         self.step_tree.heading("no", text="#")
         self.step_tree.column("no", width=32, anchor="center", stretch=False)
         self.step_tree.heading("type", text="类型")
-        self.step_tree.column("type", width=92, stretch=False)
+        self.step_tree.column("type", width=108, stretch=False)
         self.step_tree.heading("summary", text="参数摘要")
-        self.step_tree.column("summary", width=200)
+        self.step_tree.column("summary", width=190)
         tree_scroll = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.step_tree.yview)
         self.step_tree.configure(yscrollcommand=tree_scroll.set)
         self.step_tree.pack(side="left", fill="both", expand=True)
@@ -1228,14 +1235,79 @@ class AutoClickApp:
         right = ttk.Frame(body)
         self.param_box = ttk.LabelFrame(right, text="步骤参数")
         self.param_box.pack(fill="both", expand=True)
-        self.param_hint = ttk.Label(self.param_box, text="在左侧选择一个步骤后编辑参数",
-                                    foreground="#666666", justify="left", wraplength=230)
-        self.param_hint.pack(anchor="w", padx=8, pady=(4, 0))
-        self.param_frame = ttk.Frame(self.param_box)
-        self.param_frame.pack(fill="both", expand=True, padx=8, pady=4)
+        # 底部操作条：左侧放本步骤专属动作（拾取坐标 / 选择模板…），右侧放「应用修改」。
+        # 二者常驻、不随字段滚动，也不额外占一行高度——这是 880x660 下能把
+        # 「找图/找控件」这类 5 个字段全放进可视区的关键。
+        self.param_foot = ttk.Frame(self.param_box)
+        self.param_foot.pack(side="bottom", fill="x", padx=6, pady=(2, 5))
+        self.param_action_bar = ttk.Frame(self.param_foot)
+        self.param_action_bar.pack(side="left", fill="x", expand=True)
+        self.param_apply_btn = ttk.Button(self.param_foot, text="应用修改", width=11,
+                                          style="Primary.TButton", command=self.apply_params)
+        self.param_apply_btn.pack(side="right")
+        ttk.Separator(self.param_box, orient="horizontal").pack(
+            side="bottom", fill="x", padx=4, pady=(0, 2))
+        # 参数区放进 Canvas 以便纵向滚动：找图/找控件这类字段较多的步骤也不会被裁切
+        param_wrap = ttk.Frame(self.param_box)
+        param_wrap.pack(fill="both", expand=True, padx=(4, 2), pady=(1, 2))
+        canvas_bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
+        self.param_canvas = tk.Canvas(param_wrap, highlightthickness=0, bd=0,
+                                      background=canvas_bg, takefocus=0)
+        param_scroll = ttk.Scrollbar(param_wrap, orient="vertical",
+                                     command=self.param_canvas.yview)
+        self.param_canvas.configure(yscrollcommand=param_scroll.set)
+        self.param_canvas.pack(side="left", fill="both", expand=True)
+        param_scroll.pack(side="right", fill="y")
+        self.param_frame = ttk.Frame(self.param_canvas)
+        self._param_window = self.param_canvas.create_window(
+            (0, 0), window=self.param_frame, anchor="nw")
+        self.param_frame.bind("<Configure>", self._on_param_frame_configure)
+        self.param_canvas.bind("<Configure>", self._on_param_canvas_configure)
+        # 鼠标进入参数区时才接管滚轮，离开即释放，避免影响日志区滚动
+        self.param_canvas.bind("<Enter>", lambda _e: self._bind_param_wheel(True))
+        self.param_canvas.bind("<Leave>", lambda _e: self._bind_param_wheel(False))
 
         body.add(left, weight=3)
         body.add(right, weight=2)
+
+    def _on_param_frame_configure(self, _event=None) -> None:
+        """参数内容尺寸变化时更新 Canvas 的滚动范围。
+
+        :param _event: Tk 的 Configure 事件（可忽略）。
+        :return: 无返回值。
+        """
+        self.param_canvas.configure(scrollregion=self.param_canvas.bbox("all"))
+
+    def _on_param_canvas_configure(self, event) -> None:
+        """可视区尺寸变化时让参数内容横向铺满，避免输入控件被右侧裁切。
+
+        :param event: Tk 的 Configure 事件，含新的宽高。
+        :return: 无返回值。
+        """
+        self.param_canvas.itemconfigure(self._param_window, width=event.width)
+
+    def _bind_param_wheel(self, enable: bool) -> None:
+        """在参数区获得/失去鼠标时挂载或卸载滚轮事件。
+
+        :param enable: True = 挂载，False = 卸载。
+        :return: 无返回值。
+        """
+        canvas = getattr(self, "param_canvas", None)
+        if canvas is None:
+            return
+        if enable:
+            canvas.bind_all("<MouseWheel>", self._on_param_wheel)
+        else:
+            canvas.unbind_all("<MouseWheel>")
+
+    def _on_param_wheel(self, event) -> None:
+        """参数区滚轮滚动（每格 120 为一单位，Windows 惯例）。
+
+        :param event: 鼠标滚轮事件，delta 正负表示方向。
+        :return: 无返回值。
+        """
+        if self.param_canvas.winfo_exists():
+            self.param_canvas.yview_scroll(int(-event.delta / 120), "units")
 
     def _sync_flow_from_ui(self) -> None:
         """把界面上的流程级参数（名称、整体重复、出错即停止）写回流程字典。
@@ -1273,7 +1345,7 @@ class AutoClickApp:
         self.flow_stop_var.set(bool(control.get("stop_on_error", True)))
         self._refresh_step_tree()
         self._clear_param_fields()
-        self.param_hint.configure(text="在左侧选择一个步骤后编辑参数")
+        self.param_box.configure(text="步骤参数")
 
     def _refresh_step_tree(self) -> None:
         """按当前流程重建步骤列表，并尽量保持原选中项。
@@ -1307,14 +1379,17 @@ class AutoClickApp:
         """
         index = self._selected_index()
         self._clear_param_fields()
+        self.param_canvas.yview_moveto(0)  # 换步骤后参数区回到顶部
         steps = self.flow.get("steps") or []
         if index is None or index >= len(steps):
-            self.param_hint.configure(text="在左侧选择一个步骤后编辑参数")
+            self.param_box.configure(text="步骤参数 — 未选中步骤")
             return
         step = steps[index]
         kind = step.get("type", "?")
-        self.param_hint.configure(text=f"第 {index + 1} 步：{flowmod.STEP_LABELS.get(kind, kind)}"
-                                       + ("（该步骤无需参数）" if not flowmod.STEP_FIELDS.get(kind) else ""))
+        title = f"步骤参数 — 第 {index + 1} 步：{flowmod.STEP_LABELS.get(kind, kind)}"
+        if not flowmod.STEP_FIELDS.get(kind):
+            title += "（无需参数）"
+        self.param_box.configure(text=title)
         self._build_param_fields(step)
 
     def _clear_param_fields(self) -> None:
@@ -1328,6 +1403,9 @@ class AutoClickApp:
             keep = set(id(b) for b in param_buttons)
             self._pick_buttons = [(w, t) for w, t in self._pick_buttons if id(w) not in keep]
             param_buttons.clear()
+        for button in getattr(self, "_param_action_buttons", []):
+            button.destroy()
+        self._param_action_buttons.clear()
         for child in self.param_frame.winfo_children():
             child.destroy()
 
@@ -1358,44 +1436,50 @@ class AutoClickApp:
         if not fields:
             ttk.Label(self.param_frame, text="该步骤无需参数",
                       foreground="#666666").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        self.param_frame.grid_columnconfigure(1, weight=1)
         for row, (key, label, value_type) in enumerate(fields):
             ttk.Label(self.param_frame, text=f"{label}:").grid(
-                row=row, column=0, sticky="w", padx=4, pady=3)
+                row=row, column=0, sticky="w", padx=(4, 6), pady=1)
             var = tk.StringVar(value=self._field_value(step, key))
             self.param_vars[key] = var
             if value_type.startswith("choice:"):
                 options = value_type.split(":", 1)[1].split("|")
                 widget: ttk.Widget = ttk.Combobox(self.param_frame, textvariable=var,
-                                                  values=options, state="readonly", width=17)
+                                                  values=options, state="readonly", width=18)
             else:
-                widget = ttk.Entry(self.param_frame, textvariable=var, width=20)
-            widget.grid(row=row, column=1, sticky="w", pady=3, padx=4)
+                widget = ttk.Entry(self.param_frame, textvariable=var, width=18)
+            widget.grid(row=row, column=1, sticky="we", pady=1, padx=(0, 6))
 
         kind = step.get("type")
-        button_row = len(fields)
+        actions = self.param_action_bar
         if kind in ("tap", "long_press"):
-            btn = ttk.Button(self.param_frame, text="拾取坐标", width=12,
-                             command=lambda: self.toggle_pick(self._fill_param_xy))
-            btn.grid(row=button_row, column=0, columnspan=2, sticky="w", padx=4, pady=(8, 2))
-            self._track_param_pick_button(btn, "拾取坐标")
+            self._add_param_action(actions, "拾取坐标", 10, self._fill_param_xy)
         elif kind == "swipe":
-            btn_start = ttk.Button(self.param_frame, text="拾取起点", width=12,
-                                   command=lambda: self.toggle_pick(self._fill_param_start))
-            btn_start.grid(row=button_row, column=0, sticky="w", padx=4, pady=(8, 2))
-            self._track_param_pick_button(btn_start, "拾取起点")
-            btn_end = ttk.Button(self.param_frame, text="拾取终点", width=12,
-                                 command=lambda: self.toggle_pick(self._fill_param_end))
-            btn_end.grid(row=button_row, column=1, sticky="w", padx=4, pady=(8, 2))
-            self._track_param_pick_button(btn_end, "拾取终点")
+            self._add_param_action(actions, "拾取起点", 10, self._fill_param_start)
+            self._add_param_action(actions, "拾取终点", 10, self._fill_param_end)
         elif kind == "find_click":
-            btn_file = ttk.Button(self.param_frame, text="选择模板…", width=12,
-                                  command=self._pick_template_file)
-            btn_file.grid(row=button_row, column=0, sticky="w", padx=4, pady=(8, 2))
-            btn_cap = ttk.Button(self.param_frame, text="抓屏存为模板…", width=14,
-                                 command=self._capture_template)
-            btn_cap.grid(row=button_row, column=1, sticky="w", padx=4, pady=(8, 2))
-        ttk.Button(self.param_frame, text="应用修改", width=12, command=self.apply_params).grid(
-            row=button_row + 1, column=0, columnspan=2, sticky="w", padx=4, pady=(6, 2))
+            self._add_param_action(actions, "选择模板…", 11, self._pick_template_file,
+                                   pick=False)
+            self._add_param_action(actions, "抓屏存为模板…", 14, self._capture_template,
+                                   pick=False)
+
+    def _add_param_action(self, parent: ttk.Frame, text: str, width: int,
+                          handler: Callable[[], None], pick: bool = True) -> None:
+        """在参数区底部操作条添加一个本步骤专属动作按钮。
+
+        :param parent: 底部操作条容器。
+        :param text: 按钮文案。
+        :param width: 按钮宽度（字符数）。
+        :param handler: 点击回调。
+        :param pick: 是否为「拾取坐标」类按钮（需要随拾取状态切换文案）。
+        :return: 无返回值。
+        """
+        button = ttk.Button(parent, text=text, width=width,
+                            command=lambda: self.toggle_pick(handler) if pick else handler())
+        button.pack(side="left", padx=(0, 4))
+        self._param_action_buttons.append(button)
+        if pick:
+            self._track_param_pick_button(button, text)
 
     def _track_param_pick_button(self, button: ttk.Button, normal_text: str) -> None:
         """登记参数区中的拾取按钮（拾取进行中时直接显示为「停止拾取」）。
@@ -2231,7 +2315,7 @@ class AutoClickApp:
         self.record_tree.heading("no", text="#")
         self.record_tree.column("no", width=32, anchor="center", stretch=False)
         self.record_tree.heading("type", text="类型")
-        self.record_tree.column("type", width=92, stretch=False)
+        self.record_tree.column("type", width=108, stretch=False)
         self.record_tree.heading("summary", text="参数摘要")
         self.record_tree.column("summary", width=300)
         record_scroll = ttk.Scrollbar(wrap, orient="vertical", command=self.record_tree.yview)
