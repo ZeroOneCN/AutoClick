@@ -993,6 +993,7 @@ class AutoClickApp:
         if runner is None or not self.running:
             return
         if runner.paused:
+            self._apply_repeat_to_runner()  # 继续前先把暂停期间改的轮数落到执行器
             runner.resume()
             self.log(f"已继续执行（回到第 {runner.round_index} 轮，第 "
                      f"{runner.current_step} 步）", "ok")
@@ -1001,8 +1002,42 @@ class AutoClickApp:
             where = f"第 {runner.round_index} 轮" if runner.round_index else "启动阶段"
             if runner.current_step:
                 where += f"，第 {runner.current_step} 步"
-            self.log(f"已暂停（{where}）；点「继续」从当前位置接着跑，轮次不变", "warn")
+            self.log(f"已暂停（{where}）；点「继续」从当前位置接着跑，轮次不变；"
+                     f"暂停期间可改上方「重复」轮数，继续后生效", "warn")
         self._update_pause_button()
+
+    def _apply_repeat_to_runner(self) -> None:
+        """把界面上的「重复」轮数同步给正在运行的执行器（暂停/运行中均可改）。
+
+        执行器在每轮结束时重新读取轮数，因此改完不必重启任务：调大继续多跑几轮，
+        调小则在当前轮跑完后收尾；填 0 表示无限重复。输入非法时只提示不改动。
+
+        :return: 无返回值。
+        """
+        runner = self.current_runner
+        if runner is None or not self.running:
+            return
+        text = (self.flow_repeat_var.get() or "").strip()
+        try:
+            repeat = max(0, int(text or "0"))
+        except ValueError:
+            self.log(f"重复轮数「{text}」不是整数，未生效（请填 0 表示无限）", "warn")
+            return
+        if repeat == runner.repeat:
+            return
+        if getattr(runner, "begin", 0):
+            self.log("当前是「从选中开始」的调试运行，只跑一轮，不支持修改轮数", "warn")
+            return
+        runner.set_repeat(repeat)
+        self.flow.setdefault("control", {})["repeat"] = repeat
+        label = "无限" if repeat == 0 else f"{repeat} 轮"
+        if runner.paused:
+            self.log(f"已把重复轮数改为 {label}，点「继续」后按新设置执行", "ok")
+        elif repeat and repeat <= runner.round_index:
+            self.log(f"已把重复轮数改为 {label}；当前已到第 {runner.round_index} 轮，"
+                     f"本轮结束后停止", "warn")
+        else:
+            self.log(f"已把重复轮数改为 {label}，本轮结束后按新设置执行", "warn")
 
     def _update_pause_button(self) -> None:
         """按当前执行器状态刷新「暂停/继续」按钮的文案与可用性。
@@ -1139,8 +1174,12 @@ class AutoClickApp:
         ttk.Label(row_a, text="重复(0=∞):").grid(row=0, column=2, sticky="e", padx=(12, 4))
         control = self.flow.get("control") or {}
         self.flow_repeat_var = tk.StringVar(value=str(control.get("repeat", 1)))
-        ttk.Entry(row_a, textvariable=self.flow_repeat_var, width=4).grid(
-            row=0, column=3, sticky="w")
+        self.flow_repeat_entry = ttk.Entry(row_a, textvariable=self.flow_repeat_var, width=4)
+        self.flow_repeat_entry.grid(row=0, column=3, sticky="w")
+        # 暂停中允许直接改轮数：回车或离开输入框即同步给正在运行的执行器，
+        # 不必先「停止」再重新开始。运行中改同样生效，但要等本轮跑完。
+        self.flow_repeat_entry.bind("<Return>", lambda _e: self._apply_repeat_to_runner())
+        self.flow_repeat_entry.bind("<FocusOut>", lambda _e: self._apply_repeat_to_runner())
         # 失败自动重试次数与步骤间隔随机抖动比例（0 = 关闭）
         ttk.Label(row_a, text="重试:").grid(row=0, column=4, sticky="e", padx=(12, 4))
         self.flow_retry_var = tk.StringVar(value=str(control.get("retry", 1)))

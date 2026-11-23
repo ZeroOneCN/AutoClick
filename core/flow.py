@@ -267,6 +267,17 @@ class FlowRunner:
         """
         self._pause.clear()
 
+    def set_repeat(self, repeat: int) -> None:
+        """运行中修改整体重复轮数（0 = 无限），在下一个轮次边界生效。
+
+        这样暂停时调整轮数就不必先「停止」再重新开始：改完点「继续」，当前轮
+        跑完后按新轮数决定是否再开一轮（调大则继续跑，调小则在已够轮数时收尾）。
+
+        :param repeat: 新的整体重复轮数（负数按 0 处理，0 表示无限）。
+        :return: 无返回值。
+        """
+        self.repeat = max(0, int(repeat))
+
     def toggle_pause(self) -> bool:
         """切换暂停/继续状态。
 
