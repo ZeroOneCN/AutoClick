@@ -844,7 +844,8 @@ class AutoClickApp:
                 if now - last_report >= 1.0:
                     last_report = now
                     elapsed = now - started
-                    self.log(f"  已点击 {done} 次 | {elapsed:.1f}s | {done / elapsed:.1f} 次/秒")
+                    self.log(f"  已点击 {done} 次 | {flowmod.format_duration(elapsed)} | "
+                             f"{done / elapsed:.1f} 次/秒")
         except Exception as exc:
             reason = f"异常: {type(exc).__name__}: {exc}"
             self.log(f"连点任务异常：{reason}", "error")
@@ -854,7 +855,8 @@ class AutoClickApp:
 
         elapsed = time.perf_counter() - started
         rate = done / elapsed if elapsed > 0 else 0.0
-        self.log(f"连点结束：{reason} | 共 {done} 次 | 耗时 {elapsed:.2f}s | 平均 {rate:.1f} 次/秒",
+        self.log(f"连点结束：{reason} | 共 {done} 次 | 耗时 "
+                 f"{flowmod.format_duration(elapsed)} | 平均 {rate:.1f} 次/秒",
                  "ok" if done else "warn")
         self.queue.put(("task_end", reason))
 
@@ -1247,67 +1249,32 @@ class AutoClickApp:
         self.param_apply_btn.pack(side="right")
         ttk.Separator(self.param_box, orient="horizontal").pack(
             side="bottom", fill="x", padx=4, pady=(0, 2))
-        # 参数区放进 Canvas 以便纵向滚动：找图/找控件这类字段较多的步骤也不会被裁切
-        param_wrap = ttk.Frame(self.param_box)
-        param_wrap.pack(fill="both", expand=True, padx=(4, 2), pady=(1, 2))
-        canvas_bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
-        self.param_canvas = tk.Canvas(param_wrap, highlightthickness=0, bd=0,
-                                      background=canvas_bg, takefocus=0)
-        param_scroll = ttk.Scrollbar(param_wrap, orient="vertical",
-                                     command=self.param_canvas.yview)
-        self.param_canvas.configure(yscrollcommand=param_scroll.set)
-        self.param_canvas.pack(side="left", fill="both", expand=True)
-        param_scroll.pack(side="right", fill="y")
-        self.param_frame = ttk.Frame(self.param_canvas)
-        self._param_window = self.param_canvas.create_window(
-            (0, 0), window=self.param_frame, anchor="nw")
-        self.param_frame.bind("<Configure>", self._on_param_frame_configure)
-        self.param_canvas.bind("<Configure>", self._on_param_canvas_configure)
-        # 鼠标进入参数区时才接管滚轮，离开即释放，避免影响日志区滚动
-        self.param_canvas.bind("<Enter>", lambda _e: self._bind_param_wheel(True))
-        self.param_canvas.bind("<Leave>", lambda _e: self._bind_param_wheel(False))
+        # 字段区固定布局（不滚动）：动作按钮已移到下方常驻操作条，880x660 下
+        # 「找图/找控件」这类 5 个字段全部放得下，固定显示比滚动更好用。
+        self.param_frame = ttk.Frame(self.param_box)
+        self.param_frame.pack(fill="both", expand=True, padx=(6, 4), pady=(1, 2))
+        self.param_frame.grid_columnconfigure(1, weight=1)
 
         body.add(left, weight=3)
         body.add(right, weight=2)
+        # ttk 的水平分割条在首次布局后不会随右侧内容变宽而自动回退，
+        # 会出现「参数区被左侧挤窄」的问题；这里在可见尺寸确定后按固定比例校正一次。
+        self.flow_body = body
+        body.bind("<Configure>", self._on_flow_body_configure)
 
-    def _on_param_frame_configure(self, _event=None) -> None:
-        """参数内容尺寸变化时更新 Canvas 的滚动范围。
+    def _on_flow_body_configure(self, event) -> None:
+        """按 56% / 44% 固定左右分栏宽度，保证参数区总能完整容纳输入控件。
 
-        :param _event: Tk 的 Configure 事件（可忽略）。
+        只在分栏容器宽度变化时校正一次：既能在首次显示时给出合理比例，
+        又不会在用户手动拖动分隔条后被反复拉回。
+
+        :param event: Tk 的 Configure 事件，含分栏容器的当前宽度。
         :return: 无返回值。
         """
-        self.param_canvas.configure(scrollregion=self.param_canvas.bbox("all"))
-
-    def _on_param_canvas_configure(self, event) -> None:
-        """可视区尺寸变化时让参数内容横向铺满，避免输入控件被右侧裁切。
-
-        :param event: Tk 的 Configure 事件，含新的宽高。
-        :return: 无返回值。
-        """
-        self.param_canvas.itemconfigure(self._param_window, width=event.width)
-
-    def _bind_param_wheel(self, enable: bool) -> None:
-        """在参数区获得/失去鼠标时挂载或卸载滚轮事件。
-
-        :param enable: True = 挂载，False = 卸载。
-        :return: 无返回值。
-        """
-        canvas = getattr(self, "param_canvas", None)
-        if canvas is None:
+        if event.width <= 200 or event.width == getattr(self, "_flow_sash_width", 0):
             return
-        if enable:
-            canvas.bind_all("<MouseWheel>", self._on_param_wheel)
-        else:
-            canvas.unbind_all("<MouseWheel>")
-
-    def _on_param_wheel(self, event) -> None:
-        """参数区滚轮滚动（每格 120 为一单位，Windows 惯例）。
-
-        :param event: 鼠标滚轮事件，delta 正负表示方向。
-        :return: 无返回值。
-        """
-        if self.param_canvas.winfo_exists():
-            self.param_canvas.yview_scroll(int(-event.delta / 120), "units")
+        self._flow_sash_width = event.width
+        self.flow_body.sashpos(0, int(event.width * 0.56))
 
     def _sync_flow_from_ui(self) -> None:
         """把界面上的流程级参数（名称、整体重复、出错即停止）写回流程字典。
@@ -1379,7 +1346,6 @@ class AutoClickApp:
         """
         index = self._selected_index()
         self._clear_param_fields()
-        self.param_canvas.yview_moveto(0)  # 换步骤后参数区回到顶部
         steps = self.flow.get("steps") or []
         if index is None or index >= len(steps):
             self.param_box.configure(text="步骤参数 — 未选中步骤")
@@ -1427,7 +1393,7 @@ class AutoClickApp:
         return "" if value is None else str(value)
 
     def _build_param_fields(self, step: dict) -> None:
-        """根据步骤类型动态生成参数输入控件（含拾取按钮与「应用修改」）。
+        """按步骤类型在参数区生成输入控件，并把本步骤专属动作放进底部操作条。
 
         :param step: 需要编辑的步骤字典。
         :return: 无返回值。
@@ -1436,7 +1402,6 @@ class AutoClickApp:
         if not fields:
             ttk.Label(self.param_frame, text="该步骤无需参数",
                       foreground="#666666").grid(row=0, column=0, sticky="w", padx=4, pady=4)
-        self.param_frame.grid_columnconfigure(1, weight=1)
         for row, (key, label, value_type) in enumerate(fields):
             ttk.Label(self.param_frame, text=f"{label}:").grid(
                 row=row, column=0, sticky="w", padx=(4, 6), pady=1)
@@ -2056,7 +2021,7 @@ class AutoClickApp:
         if remain > 0:
             note = f"｜{self.ntp_note}" if self.ntp_note else ""
             self.schedule_state_var.set(
-                f"已设定 {self.schedule_label}，剩余 {remain:.1f} 秒{note}")
+                f"已设定 {self.schedule_label}，剩余 {flowmod.format_duration(remain)}{note}")
             self.root.after(100, self._schedule_tick)
 
     def _schedule_worker(self, flow: dict, target: float) -> None:

@@ -36,6 +36,31 @@ STEP_TYPES: list[str] = [
     "keyevent", "start_app", "find_click", "loop", "endloop",
 ]
 
+
+def format_duration(seconds: float) -> str:
+    """把秒数转成便于阅读的时长文本（60 秒进分、60 分进时）。
+
+    日志里长时间运行的流程要反复显示「已运行多久」，直接给秒数（如 3725.4 秒）
+    很难一眼判断，因此统一按下列规则转换：
+    - 不足 60 秒：`45.2 秒`（保留一位小数，短时任务仍有精度）；
+    - 不足 60 分：`3 分 20 秒`；
+    - 达到 60 分：`1 时 02 分 05 秒`。
+
+    :param seconds: 时长（秒），负值按 0 处理。
+    :return: 格式化后的中文时长文本。
+    """
+    seconds = max(0.0, seconds)
+    if int(seconds) < 60:
+        # 向下取整到 0.1 秒，避免 59.96 秒显示成「60.0 秒」却还没进到分钟
+        return f"{int(seconds * 10) / 10:.1f} 秒"
+    total = int(seconds)
+    hours, remain = divmod(total, 3600)
+    minutes, secs = divmod(remain, 60)
+    if hours:
+        return f"{hours} 时 {minutes:02d} 分 {secs:02d} 秒"
+    return f"{minutes} 分 {secs:02d} 秒"
+
+
 # 各步骤类型的参数字段定义：(键, 界面标签, 值类型)
 # 值类型为 int / float / str / choice:...
 STEP_FIELDS: dict[str, list[tuple[str, str, str]]] = {
@@ -300,13 +325,13 @@ class FlowRunner:
             if self.repeat != 1:
                 # 整体重复（含「重复 0 = 无限」）时，每轮开头都给醒目的轮次标记，
                 # 便于在大量日志中定位当前跑到第几轮、已耗时多久。
-                elapsed = time.time() - self._started_at
+                elapsed = format_duration(time.time() - self._started_at)
                 if self.repeat:
                     self._log(f"===== 第 {round_index}/{self.repeat} 轮开始"
-                              f"（已运行 {elapsed:.1f} 秒）=====")
+                              f"（已运行 {elapsed}）=====")
                 else:
                     self._log(f"===== 第 {round_index} 轮开始"
-                              f"（无限重复，已运行 {elapsed:.1f} 秒，点「停止」结束）=====")
+                              f"（无限重复，已运行 {elapsed}，点「停止」结束）=====")
             # 第一轮从 begin 起（调试用），后续轮次按整体重复从第 1 步重新开始
             start = self.begin if round_index == 1 else 0
             if not self._run_range(start, len(self.steps)):
@@ -317,7 +342,7 @@ class FlowRunner:
                 break
         if round_index > 1:
             self._log(f"流程结束：共执行 {round_index} 轮，耗时 "
-                      f"{time.time() - self._started_at:.1f} 秒", "ok")
+                      f"{format_duration(time.time() - self._started_at)}", "ok")
         return result, reason
 
     def run_single(self, index: int) -> tuple[bool, str]:
